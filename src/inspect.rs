@@ -106,6 +106,11 @@ const TOOLS: &[ToolSpec] = &[
     ),
     ToolSpec::new("joern", "C/C++ mapping", "code property graph analysis"),
     ToolSpec::new(
+        "joern-parse",
+        "C/C++ mapping",
+        "Joern code property graph creation",
+    ),
+    ToolSpec::new(
         "codeql",
         "C/C++ mapping",
         "semantic database and query analysis",

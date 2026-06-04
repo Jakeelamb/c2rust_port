@@ -323,6 +323,12 @@ fn fact_tables() -> Vec<FactTable> {
             "Compile, lint, semantic, and security findings.",
         ),
         fact(
+            "semantic_graphs",
+            "tool:artifact",
+            &["clang-query", "codeql", "joern-parse"],
+            "AST, CodeQL database/SARIF, and Joern CPG artifacts that preserve deep semantic structure.",
+        ),
+        fact(
             "runtime_events",
             "tool:command:event_hash",
             &["strace", "ltrace", "rr", "gdb", "lldb"],
@@ -414,6 +420,11 @@ fn dedupe_rules() -> Vec<DedupeRule> {
             "diagnostics",
             "tool:path:line:code",
             &["compiler", "clang-tidy", "codeql", "clippy"],
+        ),
+        dedupe(
+            "semantic_graphs",
+            "tool:artifact",
+            &["codeql", "joern-parse", "clang-query"],
         ),
         dedupe(
             "runtime_events",
@@ -551,6 +562,7 @@ fn write_skeleton_files(out: &Utf8Path) -> Result<()> {
         "symbols",
         "call_edges",
         "diagnostics",
+        "semantic_graphs",
         "runtime_events",
         "profiles",
         "coverage",
@@ -597,6 +609,27 @@ fn collect_raw_evidence(
             "make",
             &["make", "-n"],
             "dry-run build graph",
+        )?);
+    }
+    if installed.contains("bear") && source.join("Makefile").exists() {
+        std::fs::create_dir_all(out.join("raw/build-capture/bear"))
+            .with_context(|| format!("create {}", out.join("raw/build-capture/bear")))?;
+        let bear_compile_commands = out.join("raw/build-capture/bear/compile_commands.json");
+        let args = vec![
+            "bear".to_string(),
+            "--output".to_string(),
+            bear_compile_commands.to_string(),
+            "--".to_string(),
+            "make".to_string(),
+            "-B".to_string(),
+        ];
+        runs.push(run_capture_owned(
+            source,
+            out,
+            "build-capture",
+            "bear",
+            &args,
+            "full compile database capture through build interception",
         )?);
     }
     if installed.contains("cmake") && source.join("CMakeLists.txt").exists() {
@@ -646,6 +679,23 @@ fn collect_raw_evidence(
             "diagnostic checks over bounded source set",
         )?);
     }
+    if installed.contains("clang-query") && !compile_units.is_empty() {
+        let mut args = vec![
+            "clang-query".to_string(),
+            "-c".to_string(),
+            "match functionDecl(isDefinition()).bind(\"function\")".to_string(),
+        ];
+        args.extend(compile_units.iter().take(32).map(|file| file.to_string()));
+        args.push("--extra-arg=-I.".to_string());
+        runs.push(run_capture_owned(
+            source,
+            out,
+            "source-structure",
+            "clang-query",
+            &args,
+            "AST function declaration extraction",
+        )?);
+    }
     if installed.contains("ctags") && !source_files.is_empty() {
         let mut args = vec![
             "ctags".to_string(),
@@ -672,6 +722,76 @@ fn collect_raw_evidence(
             "cflow",
             &args,
             "static call graph",
+        )?);
+    }
+    if installed.contains("codeql") && source.join("Makefile").exists() {
+        std::fs::create_dir_all(out.join("raw/semantic-analysis/codeql"))
+            .with_context(|| format!("create {}", out.join("raw/semantic-analysis/codeql")))?;
+        let stamp = timestamp_slug();
+        let db = out.join(format!("raw/semantic-analysis/codeql/db-{stamp}"));
+        let create_args = vec![
+            "codeql".to_string(),
+            "database".to_string(),
+            "create".to_string(),
+            db.to_string(),
+            "--language=cpp".to_string(),
+            "--source-root".to_string(),
+            source.to_string(),
+            "--command".to_string(),
+            "make -B".to_string(),
+        ];
+        runs.push(run_capture_owned(
+            source,
+            out,
+            "semantic-analysis",
+            "codeql-create",
+            &create_args,
+            "CodeQL C/C++ database creation",
+        )?);
+        if let Some(query_spec) = discover_codeql_cpp_query_spec() {
+            let sarif = out.join(format!(
+                "raw/semantic-analysis/codeql/results-{stamp}.sarif"
+            ));
+            let analyze_args = vec![
+                "codeql".to_string(),
+                "database".to_string(),
+                "analyze".to_string(),
+                db.to_string(),
+                query_spec,
+                "--format=sarif-latest".to_string(),
+                "--output".to_string(),
+                sarif.to_string(),
+            ];
+            runs.push(run_capture_owned(
+                source,
+                out,
+                "semantic-analysis",
+                "codeql-analyze",
+                &analyze_args,
+                "CodeQL semantic query export to SARIF",
+            )?);
+        }
+    }
+    if installed.contains("joern-parse") {
+        std::fs::create_dir_all(out.join("raw/semantic-analysis/joern"))
+            .with_context(|| format!("create {}", out.join("raw/semantic-analysis/joern")))?;
+        let stamp = timestamp_slug();
+        let cpg = out.join(format!("raw/semantic-analysis/joern/cpg-{stamp}.bin"));
+        let args = vec![
+            "joern-parse".to_string(),
+            source.to_string(),
+            "-o".to_string(),
+            cpg.to_string(),
+            "--language".to_string(),
+            "C".to_string(),
+        ];
+        runs.push(run_capture_owned(
+            source,
+            out,
+            "semantic-analysis",
+            "joern-parse",
+            &args,
+            "Joern code property graph creation",
         )?);
     }
     if installed.contains("cargo") && target.join("Cargo.toml").exists() {
@@ -797,6 +917,10 @@ fn normalize_facts(
         &normalize_diagnostics(out, evidence_runs)?,
     )?;
     write_jsonl_values(
+        &out.join("facts/semantic_graphs.jsonl"),
+        &normalize_semantic_graphs(out, evidence_runs)?,
+    )?;
+    write_jsonl_values(
         &out.join("facts/runtime_events.jsonl"),
         &normalize_runtime_events(out, evidence_runs)?,
     )?;
@@ -846,40 +970,12 @@ fn normalize_build_units(
     evidence_runs: &[EvidenceRun],
 ) -> Result<Vec<serde_json::Value>> {
     let mut rows = Vec::new();
-    let compile_commands = source.join("compile_commands.json");
-    if compile_commands.exists() {
-        let text = std::fs::read_to_string(&compile_commands)
-            .with_context(|| format!("read {compile_commands}"))?;
-        if let Ok(commands) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(items) = commands.as_array() {
-                for item in items {
-                    let command = item
-                        .get("command")
-                        .and_then(|value| value.as_str())
-                        .map(ToString::to_string)
-                        .or_else(|| {
-                            item.get("arguments").map(|value| {
-                                value
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(|part| part.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            })
-                        })
-                        .unwrap_or_default();
-                    rows.push(serde_json::json!({
-                        "fact_type": "build_unit",
-                        "key": sha256_hex(command.as_bytes()),
-                        "tool": "compile_commands.json",
-                        "file": item.get("file"),
-                        "directory": item.get("directory"),
-                        "command": command,
-                        "provenance": [compile_commands.to_string()],
-                    }));
-                }
-            }
+    for compile_commands in [
+        source.join("compile_commands.json"),
+        out.join("raw/build-capture/bear/compile_commands.json"),
+    ] {
+        if compile_commands.exists() {
+            rows.extend(parse_compile_commands(&compile_commands)?);
         }
     }
     for run in evidence_runs.iter().filter(|run| run.tool == "make") {
@@ -897,13 +993,7 @@ fn normalize_build_units(
             }));
         }
     }
-    rows.sort_by_key(|row| {
-        row.get("key")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string()
-    });
-    rows.dedup_by(|left, right| left.get("key") == right.get("key"));
+    let rows = dedupe_rows_by_key_merge_provenance(rows);
     let _ = out;
     Ok(rows)
 }
@@ -929,6 +1019,10 @@ fn normalize_symbols(out: &Utf8Path, repo_map: &SourceRepoMap) -> Result<Vec<ser
                 rows.push(symbol);
             }
         }
+    }
+    let clang_query = out.join("raw/source-structure/clang-query/stdout.txt");
+    if clang_query.exists() {
+        rows.extend(parse_clang_query_symbols(&read_lines(&clang_query)?));
     }
     rows.sort_by_key(|row| {
         row.get("key")
@@ -979,10 +1073,17 @@ fn normalize_diagnostics(
     evidence_runs: &[EvidenceRun],
 ) -> Result<Vec<serde_json::Value>> {
     let mut rows = Vec::new();
-    for run in evidence_runs
-        .iter()
-        .filter(|run| matches!(run.tool.as_str(), "clang" | "clang-tidy" | "cargo-check"))
-    {
+    for run in evidence_runs.iter().filter(|run| {
+        matches!(
+            run.tool.as_str(),
+            "clang"
+                | "clang-tidy"
+                | "cargo-check"
+                | "codeql-create"
+                | "codeql-analyze"
+                | "joern-parse"
+        )
+    }) {
         let mut lines = read_lines(&run.stdout_path)?;
         lines.extend(read_lines(&run.stderr_path)?);
         for (index, line) in lines.into_iter().enumerate() {
@@ -999,6 +1100,72 @@ fn normalize_diagnostics(
                 "provenance": [run.stdout_path, run.stderr_path],
             }));
         }
+    }
+    rows.extend(normalize_codeql_sarif_diagnostics(_out)?);
+    Ok(rows)
+}
+
+fn normalize_semantic_graphs(
+    out: &Utf8Path,
+    evidence_runs: &[EvidenceRun],
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for run in evidence_runs.iter().filter(|run| {
+        matches!(
+            run.tool.as_str(),
+            "clang-query" | "codeql-create" | "codeql-analyze" | "joern-parse"
+        )
+    }) {
+        rows.push(serde_json::json!({
+            "fact_type": "semantic_graph_run",
+            "key": format!("{}:{}", run.tool, run.timestamp),
+            "tool": run.tool,
+            "status": run.status,
+            "command": run.command,
+            "stdout_path": run.stdout_path,
+            "stderr_path": run.stderr_path,
+            "notes": run.notes,
+            "provenance": [run.stdout_path, run.stderr_path],
+        }));
+    }
+    for path in find_paths(out.join("raw/semantic-analysis/codeql"), Some("sarif"))? {
+        let bytes = std::fs::read(&path).with_context(|| format!("read {path}"))?;
+        rows.push(serde_json::json!({
+            "fact_type": "semantic_graph_artifact",
+            "key": format!("codeql:sarif:{path}"),
+            "tool": "codeql",
+            "artifact_kind": "sarif",
+            "path": path,
+            "bytes": bytes.len(),
+            "sha256": sha256_hex(&bytes),
+            "provenance": [path.to_string()],
+        }));
+    }
+    for path in find_paths(out.join("raw/semantic-analysis/codeql"), None)?
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name.starts_with("db-")))
+    {
+        rows.push(serde_json::json!({
+            "fact_type": "semantic_graph_artifact",
+            "key": format!("codeql:database:{path}"),
+            "tool": "codeql",
+            "artifact_kind": "database",
+            "path": path,
+            "provenance": [path.to_string()],
+        }));
+    }
+    for path in find_paths(out.join("raw/semantic-analysis/joern"), Some("bin"))? {
+        let bytes = std::fs::read(&path).with_context(|| format!("read {path}"))?;
+        rows.push(serde_json::json!({
+            "fact_type": "semantic_graph_artifact",
+            "key": format!("joern:cpg:{path}"),
+            "tool": "joern-parse",
+            "artifact_kind": "cpg",
+            "path": path,
+            "bytes": bytes.len(),
+            "sha256": sha256_hex(&bytes),
+            "provenance": [path.to_string()],
+        }));
     }
     Ok(rows)
 }
@@ -1610,6 +1777,47 @@ fn write_jsonl_values(path: &Utf8Path, rows: &[serde_json::Value]) -> Result<()>
     std::fs::write(path, text).with_context(|| format!("write {path}"))
 }
 
+fn dedupe_rows_by_key_merge_provenance(rows: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut by_key = BTreeMap::<String, serde_json::Value>::new();
+    for row in rows {
+        let key = row
+            .get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(existing) = by_key.get_mut(&key) {
+            let mut provenance = provenance_values(existing);
+            provenance.extend(provenance_values(&row));
+            provenance.sort();
+            provenance.dedup();
+            if let Some(object) = existing.as_object_mut() {
+                object.insert(
+                    "provenance".to_string(),
+                    serde_json::Value::Array(
+                        provenance
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+        } else {
+            by_key.insert(key, row);
+        }
+    }
+    by_key.into_values().collect()
+}
+
+fn provenance_values(row: &serde_json::Value) -> Vec<String> {
+    row.get("provenance")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn read_lines(path: impl AsRef<std::path::Path>) -> Result<Vec<String>> {
     let path = path.as_ref();
     if !path.exists() {
@@ -1617,6 +1825,43 @@ fn read_lines(path: impl AsRef<std::path::Path>) -> Result<Vec<String>> {
     }
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     Ok(text.lines().map(ToString::to_string).collect())
+}
+
+fn parse_compile_commands(path: &Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    let commands = serde_json::from_str::<serde_json::Value>(&text)
+        .with_context(|| format!("parse {path}"))?;
+    if let Some(items) = commands.as_array() {
+        for item in items {
+            let command = item
+                .get("command")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+                .or_else(|| {
+                    item.get("arguments").map(|value| {
+                        value
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|part| part.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                })
+                .unwrap_or_default();
+            rows.push(serde_json::json!({
+                "fact_type": "build_unit",
+                "key": sha256_hex(command.as_bytes()),
+                "tool": "compile_commands.json",
+                "file": item.get("file"),
+                "directory": item.get("directory"),
+                "command": command,
+                "provenance": [path.to_string()],
+            }));
+        }
+    }
+    Ok(rows)
 }
 
 fn parse_ctags_line(line: &str) -> Option<serde_json::Value> {
@@ -1636,6 +1881,55 @@ fn parse_ctags_line(line: &str) -> Option<serde_json::Value> {
         "signature": signature,
         "provenance": ["ctags"],
     }))
+}
+
+fn parse_clang_query_symbols(lines: &[String]) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let mut pending: Option<(String, u64)> = None;
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some((path, line_number)) = parse_clang_query_bind_line(trimmed) {
+            pending = Some((path, line_number));
+            continue;
+        }
+        let Some((path, line_number)) = pending.take() else {
+            continue;
+        };
+        let Some(signature) = trimmed.split('|').nth(1).map(str::trim) else {
+            pending = Some((path, line_number));
+            continue;
+        };
+        let Some(name) = signature
+            .split('(')
+            .next()
+            .and_then(|prefix| prefix.split_whitespace().last())
+        else {
+            continue;
+        };
+        rows.push(serde_json::json!({
+            "fact_type": "symbol",
+            "key": format!("{path}:{name}:{line_number}:clang-query"),
+            "name": name.trim_matches('*'),
+            "kind": "function",
+            "path": path,
+            "line": line_number,
+            "signature": signature,
+            "provenance": ["clang-query"],
+        }));
+    }
+    rows
+}
+
+fn parse_clang_query_bind_line(line: &str) -> Option<(String, u64)> {
+    if !line.contains("note: \"function\" binds here") {
+        return None;
+    }
+    let location = line.split(": note:").next()?;
+    let mut parts = location.rsplitn(3, ':');
+    let _column = parts.next()?;
+    let line_number = parts.next()?;
+    let path = parts.next()?;
+    Some((path.to_string(), line_number.parse().ok()?))
 }
 
 fn parse_cflow_edges(lines: &[String]) -> Vec<serde_json::Value> {
@@ -1675,6 +1969,86 @@ fn parse_cflow_edges(lines: &[String]) -> Vec<serde_json::Value> {
         stack.push((level, name.to_string()));
     }
     rows
+}
+
+fn normalize_codeql_sarif_diagnostics(out: &Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for path in find_paths(out.join("raw/semantic-analysis/codeql"), Some("sarif"))? {
+        let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+        let Ok(sarif) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(runs) = sarif.get("runs").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for (run_index, run) in runs.iter().enumerate() {
+            let Some(results) = run.get("results").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            for (result_index, result) in results.iter().enumerate() {
+                let message = result
+                    .get("message")
+                    .and_then(|value| value.get("text"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let rule_id = result
+                    .get("ruleId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                rows.push(serde_json::json!({
+                    "fact_type": "diagnostic",
+                    "key": format!("codeql:{run_index}:{result_index}:{rule_id}"),
+                    "tool": "codeql",
+                    "rule_id": rule_id,
+                    "message": message,
+                    "locations": result.get("locations"),
+                    "provenance": [path.to_string()],
+                }));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn find_paths(root: Utf8PathBuf, extension: Option<&str>) -> Result<Vec<Utf8PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+        let path = utf8_path(entry.path())?;
+        if let Some(extension) = extension {
+            if entry.file_type().is_file() && path.extension() == Some(extension) {
+                paths.push(path);
+            }
+        } else if entry.file_type().is_dir() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn timestamp_slug() -> String {
+    let now = Utc::now();
+    format!(
+        "{}-{}",
+        now.format("%Y%m%dT%H%M%SZ"),
+        now.timestamp_subsec_nanos()
+    )
+}
+
+fn discover_codeql_cpp_query_spec() -> Option<String> {
+    for spec in ["cpp-code-scanning.qls", "codeql/cpp-queries"] {
+        let output = Command::new("codeql")
+            .args(["resolve", "queries", spec])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            return Some(spec.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

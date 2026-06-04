@@ -78,6 +78,7 @@ The fact tables are:
 - `symbols`
 - `call_edges`
 - `diagnostics`
+- `semantic_graphs`
 - `runtime_events`
 - `profiles`
 - `coverage`
@@ -85,7 +86,7 @@ The fact tables are:
 - `rust_workspace`
 - `repo_map`
 
-Current normalizers populate these tables from repo walk, compile database or `make -n`, `ctags`, `cflow`, compiler/linter output, benchmark manifests/runs, cargo metadata/check output, and the generated repo map. Tracing-aware normalizers are already wired: `strace`/`ltrace`/debugger output normalizes to `runtime_events`, profiler output normalizes to `profiles`, and coverage output normalizes to `coverage` when those raw evidence runners are enabled.
+Current normalizers populate these tables from repo walk, compile database or `make -n`, `bear` compile database output, `ctags`, `cflow`, `clang-query` AST output, CodeQL database artifacts, CodeQL SARIF when a local C/C++ query pack is installed, Joern CPG artifacts, compiler/linter output, benchmark manifests/runs, cargo metadata/check output, and the generated repo map. Tracing-aware normalizers are already wired: `strace`/`ltrace`/debugger output normalizes to `runtime_events`, profiler output normalizes to `profiles`, and coverage output normalizes to `coverage` when those raw evidence runners are enabled.
 
 The source repo map records:
 
@@ -99,7 +100,7 @@ The audit records `name`, `category`, `purpose`, `installed`, and `path`. Useful
 
 - Repo mapping: `repo-system-map`
 - Repo bundling: `repomix`
-- C/C++ mapping: `clang`, `clang++`, `clang-tidy`, `clang-query`, `clangd`, `ctags`, `cflow`, `cscope`, `doxygen`, `joern`, `codeql`
+- C/C++ mapping: `clang`, `clang++`, `clang-tidy`, `clang-query`, `clangd`, `ctags`, `cflow`, `cscope`, `doxygen`, `joern`, `joern-parse`, `codeql`
 - C/C++ build capture: `bear`, `intercept-build`, `compiledb`, `cmake`, `make`, `ninja`, `meson`, `pkg-config`
 - C/C++ tracing: `llvm-cov`, `llvm-profdata`, `gprof`, `gcov`, `lcov`
 - Runtime tracing: `strace`, `ltrace`, `perf`, `valgrind`, `callgrind_annotate`, `rr`, `gdb`, `lldb`, `bpftrace`, `hyperfine`, `time`, `heaptrack`
