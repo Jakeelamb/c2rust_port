@@ -2,7 +2,7 @@ use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::Parser;
 
-use crate::{bench, init, inspect, packets};
+use crate::{bench, init, inspect, knowledge, packets};
 
 #[derive(Debug, Parser)]
 #[command(name = "c2rust-port")]
@@ -17,6 +17,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let plan = init::resolve_repo_plan(&cli.repo)?;
     init::apply_init(&plan)?;
     inspect::run(&plan.source_repo)?;
+    knowledge::run(&plan.source_repo, &plan.target_repo)?;
     bench::prepare(&plan.source_repo)?;
     bench::run_source(&plan.source_repo)?;
     packets::run(&plan.source_repo, &plan.target_repo)?;

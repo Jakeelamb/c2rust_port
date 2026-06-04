@@ -13,6 +13,11 @@ const TOOLS: &[ToolSpec] = &[
         "cross-language repository maps and packet rows",
     ),
     ToolSpec::new(
+        "repomix",
+        "repo bundling",
+        "final source and fact bundle for agent context",
+    ),
+    ToolSpec::new(
         "clang",
         "C/C++ mapping",
         "preprocessing, AST, diagnostics, compile checks",

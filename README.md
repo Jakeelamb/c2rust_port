@@ -1,6 +1,6 @@
 # c2rust_port
 
-`c2rust_port` maps one C/C++ porting repo, captures tracing evidence, prepares benchmark manifests, and writes bounded Rust porting packets. V1 is a deterministic planner and evidence collector, not an autonomous editor.
+`c2rust_port` maps one C/C++ porting repo, captures tracing evidence, prepares benchmark manifests, builds an exhaustive knowledge base, and writes bounded Rust porting packets. V1 is a deterministic planner and evidence collector, not an autonomous editor.
 
 Binary name: `c2rust-port`.
 
@@ -24,9 +24,10 @@ Each run does the same phases:
 1. Resolve source and target paths.
 2. Create the target scaffold if it is missing.
 3. Inspect the source repo.
-4. Prepare tiny, smoke, medium, and large benchmark manifests.
-5. Run source-build probe evidence.
-6. Generate bounded translator packets in the target repo.
+4. Generate the knowledge-base strategy and consolidation skeleton.
+5. Prepare tiny, smoke, medium, and large benchmark manifests.
+6. Run source-build probe evidence.
+7. Generate bounded translator packets in the target repo.
 
 ## Outputs
 
@@ -39,6 +40,11 @@ Source repo outputs:
 - `.c2rust-port/inspect/diagnostic-runs.jsonl`
 - `.c2rust-port/bench/manifests/*.json`
 - `.c2rust-port/bench/runs/*.jsonl`
+- `.c2rust-port/knowledge/knowledge-strategy.json`
+- `.c2rust-port/knowledge/KNOWLEDGE.md`
+- `.c2rust-port/knowledge/raw/**`
+- `.c2rust-port/knowledge/facts/*.jsonl`
+- `.c2rust-port/knowledge/bundles/full-picture.md`
 
 Target repo outputs:
 
@@ -49,11 +55,36 @@ Target repo outputs:
 - `.c-to-rust-port/prompt_profiles/*.toml`
 - `.c-to-rust-port/packet_outcomes.jsonl`
 
+## Knowledge Model
+
+The intended model is exhaustive upfront evidence collection:
+
+1. Run every installed relevant mapper, tracer, build-capture, benchmark, and Rust analysis tool that can execute safely.
+2. Preserve raw outputs under `.c2rust-port/knowledge/raw/<stage>/`.
+3. Normalize outputs into `.c2rust-port/knowledge/facts/*.jsonl`.
+4. Dedupe facts by stable keys while retaining provenance for every source tool.
+5. Generate `.c2rust-port/knowledge/bundles/full-picture.md` as the reusable development map.
+6. Use `repomix` as a final bundling layer when installed, alongside normalized facts and summaries.
+
+The fact tables are:
+
+- `files`
+- `build_units`
+- `symbols`
+- `call_edges`
+- `diagnostics`
+- `runtime_events`
+- `profiles`
+- `coverage`
+- `benchmarks`
+- `rust_workspace`
+
 ## Tool Audit
 
 The audit records `name`, `category`, `purpose`, `installed`, and `path`. Useful tools are grouped across both sides of the port:
 
 - Repo mapping: `repo-system-map`
+- Repo bundling: `repomix`
 - C/C++ mapping: `clang`, `clang++`, `clang-tidy`, `clang-query`, `clangd`, `ctags`, `cflow`, `cscope`, `doxygen`, `joern`, `codeql`
 - C/C++ build capture: `bear`, `intercept-build`, `compiledb`, `cmake`, `make`, `ninja`, `meson`, `pkg-config`
 - C/C++ tracing: `llvm-cov`, `llvm-profdata`, `gprof`, `gcov`, `lcov`
