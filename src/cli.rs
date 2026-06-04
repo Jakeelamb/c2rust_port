@@ -2,7 +2,7 @@ use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::Parser;
 
-use crate::{bench, init, inspect, knowledge, packets};
+use crate::{bench, init, inspect, knowledge, packets, synthesize};
 
 #[derive(Debug, Parser)]
 #[command(name = "c2rust-port")]
@@ -20,6 +20,7 @@ pub fn run(cli: Cli) -> Result<()> {
     bench::prepare(&plan.source_repo)?;
     bench::run_source(&plan.source_repo)?;
     knowledge::run(&plan.source_repo, &plan.target_repo)?;
+    synthesize::run(&plan.source_repo, &plan.target_repo)?;
     packets::run(&plan.source_repo, &plan.target_repo)?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())

@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::BufRead;
 use std::process::Command;
 use walkdir::WalkDir;
 
@@ -108,8 +109,14 @@ struct RustModulePlan {
     reason: String,
 }
 
+const MAX_REPO_MAP_CALL_EDGES: usize = 100_000;
+const MAX_NORMALIZED_CFLOW_EDGES: usize = 250_000;
+
 pub fn run(source: &Utf8Path, target: &Utf8Path) -> Result<()> {
     let out = source.join(".c2rust-port/knowledge");
+    if out.exists() {
+        std::fs::remove_dir_all(&out).with_context(|| format!("remove stale {out}"))?;
+    }
     std::fs::create_dir_all(out.join("raw")).with_context(|| format!("create {out}/raw"))?;
     std::fs::create_dir_all(out.join("facts")).with_context(|| format!("create {out}/facts"))?;
     std::fs::create_dir_all(out.join("bundles"))
@@ -148,7 +155,13 @@ pub fn run(source: &Utf8Path, target: &Utf8Path) -> Result<()> {
     write_json(&out.join("repo-map.json"), &repo_map)?;
     write_repo_map_markdown(&out.join("repo-map.md"), &repo_map)?;
     write_mirror_docs(target, &repo_map)?;
-    write_full_picture(&out.join("bundles/full-picture.md"), &strategy, &repo_map)?;
+    write_full_picture(
+        &out.join("bundles/full-picture.md"),
+        &strategy,
+        &repo_map,
+        &out,
+        &evidence_runs,
+    )?;
     println!("wrote knowledge strategy to {out}");
     Ok(())
 }
@@ -176,9 +189,7 @@ fn stages() -> Vec<KnowledgeStage> {
             "Map files, symbols, declarations, definitions, includes, and source-level ownership boundaries.",
             &[
                 "repo-system-map",
-                "clang",
-                "clang++",
-                "clang-query",
+                "clang-query (compile database only)",
                 "clangd",
                 "ctags",
                 "cflow",
@@ -195,7 +206,7 @@ fn stages() -> Vec<KnowledgeStage> {
         stage(
             "semantic-analysis",
             "Extract diagnostics, AST facts, semantic database rows, dataflow hints, and code-property graph facts.",
-            &["clang-tidy", "joern", "codeql"],
+            &["clang-tidy (compile database only)", "joern", "codeql"],
             "raw/semantic-analysis",
             &["facts/diagnostics.jsonl"],
         ),
@@ -319,7 +330,7 @@ fn fact_tables() -> Vec<FactTable> {
         fact(
             "diagnostics",
             "tool:path:line:code",
-            &["clang", "clang-tidy", "codeql", "cargo", "clippy-driver"],
+            &["clang-tidy", "codeql", "cargo", "clippy-driver"],
             "Compile, lint, semantic, and security findings.",
         ),
         fact(
@@ -599,7 +610,6 @@ fn collect_raw_evidence(
         .collect();
     let mut runs = Vec::new();
     let source_files = source_files(source)?;
-    let compile_units = compile_units(&source_files);
 
     if installed.contains("make") && source.join("Makefile").exists() {
         runs.push(run_capture(
@@ -649,27 +659,28 @@ fn collect_raw_evidence(
             "configure probe for compile database",
         )?);
     }
-    if installed.contains("clang") && !compile_units.is_empty() {
-        let mut args = vec!["clang".to_string(), "-fsyntax-only".to_string()];
-        args.extend(compile_units.iter().take(64).map(|file| file.to_string()));
-        runs.push(run_capture_owned(
-            source,
-            out,
-            "semantic-analysis",
-            "clang",
-            &args,
-            "syntax-only compiler diagnostics over bounded source set",
-        )?);
-    }
-    if installed.contains("clang-tidy") && !compile_units.is_empty() {
+    let compile_databases = compile_database_paths(source, out)?;
+    let compile_db_dir = compile_databases
+        .first()
+        .and_then(|path| path.parent())
+        .map(Utf8Path::to_path_buf);
+    let compile_db_units = compile_database_units(&compile_databases)?;
+    if installed.contains("clang-tidy") && !compile_db_units.is_empty() {
         let mut args = vec![
             "clang-tidy".to_string(),
             "--quiet".to_string(),
             "-checks=clang-diagnostic-*,bugprone-*,performance-*".to_string(),
         ];
-        args.extend(compile_units.iter().take(32).map(|file| file.to_string()));
-        args.push("--".to_string());
-        args.push("-I.".to_string());
+        if let Some(compile_db_dir) = &compile_db_dir {
+            args.push("-p".to_string());
+            args.push(compile_db_dir.to_string());
+        }
+        args.extend(
+            compile_db_units
+                .iter()
+                .take(32)
+                .map(|file| file.to_string()),
+        );
         runs.push(run_capture_owned(
             source,
             out,
@@ -679,14 +690,22 @@ fn collect_raw_evidence(
             "diagnostic checks over bounded source set",
         )?);
     }
-    if installed.contains("clang-query") && !compile_units.is_empty() {
+    if installed.contains("clang-query") && !compile_db_units.is_empty() {
         let mut args = vec![
             "clang-query".to_string(),
             "-c".to_string(),
             "match functionDecl(isDefinition()).bind(\"function\")".to_string(),
         ];
-        args.extend(compile_units.iter().take(32).map(|file| file.to_string()));
-        args.push("--extra-arg=-I.".to_string());
+        if let Some(compile_db_dir) = &compile_db_dir {
+            args.push("-p".to_string());
+            args.push(compile_db_dir.to_string());
+        }
+        args.extend(
+            compile_db_units
+                .iter()
+                .take(32)
+                .map(|file| file.to_string()),
+        );
         runs.push(run_capture_owned(
             source,
             out,
@@ -722,6 +741,31 @@ fn collect_raw_evidence(
             "cflow",
             &args,
             "static call graph",
+        )?);
+    }
+    if installed.contains("cscope") && !source_files.is_empty() {
+        let cscope_dir = out.join("raw/source-structure/cscope");
+        std::fs::create_dir_all(&cscope_dir).with_context(|| format!("create {cscope_dir}"))?;
+        let file_list = cscope_dir.join("cscope.files");
+        write_cscope_file_list(&file_list, &source_files)?;
+        let database = cscope_dir.join("cscope.out");
+        let args = vec![
+            "cscope".to_string(),
+            "-b".to_string(),
+            "-q".to_string(),
+            "-k".to_string(),
+            "-f".to_string(),
+            database.to_string(),
+            "-i".to_string(),
+            file_list.to_string(),
+        ];
+        runs.push(run_capture_owned(
+            source,
+            out,
+            "source-structure",
+            "cscope",
+            &args,
+            "symbol and caller/callee cross-reference database",
         )?);
     }
     if installed.contains("codeql") && source.join("Makefile").exists() {
@@ -970,14 +1014,11 @@ fn normalize_build_units(
     evidence_runs: &[EvidenceRun],
 ) -> Result<Vec<serde_json::Value>> {
     let mut rows = Vec::new();
-    for compile_commands in [
-        source.join("compile_commands.json"),
-        out.join("raw/build-capture/bear/compile_commands.json"),
-    ] {
-        if compile_commands.exists() {
-            rows.extend(parse_compile_commands(&compile_commands)?);
-        }
+    for compile_commands in compile_database_paths(source, out)? {
+        rows.extend(parse_compile_commands(&compile_commands)?);
     }
+    rows.extend(parse_cmake_build_units(source)?);
+    rows.extend(parse_makefile_build_units(source)?);
     for run in evidence_runs.iter().filter(|run| run.tool == "make") {
         for (index, line) in read_lines(&run.stdout_path)?.into_iter().enumerate() {
             if line.trim().is_empty() {
@@ -994,7 +1035,6 @@ fn normalize_build_units(
         }
     }
     let rows = dedupe_rows_by_key_merge_provenance(rows);
-    let _ = out;
     Ok(rows)
 }
 
@@ -1056,7 +1096,10 @@ fn normalize_call_edges(
     }
     let cflow = out.join("raw/source-structure/cflow/stdout.txt");
     if cflow.exists() {
-        rows.extend(parse_cflow_edges(&read_lines(&cflow)?));
+        rows.extend(parse_cflow_edges_from_path(
+            &cflow,
+            MAX_NORMALIZED_CFLOW_EDGES,
+        )?);
     }
     rows.sort_by_key(|row| {
         row.get("key")
@@ -1076,12 +1119,7 @@ fn normalize_diagnostics(
     for run in evidence_runs.iter().filter(|run| {
         matches!(
             run.tool.as_str(),
-            "clang"
-                | "clang-tidy"
-                | "cargo-check"
-                | "codeql-create"
-                | "codeql-analyze"
-                | "joern-parse"
+            "clang-tidy" | "cargo-check" | "codeql-create" | "codeql-analyze" | "joern-parse"
         )
     }) {
         let mut lines = read_lines(&run.stdout_path)?;
@@ -1463,6 +1501,8 @@ fn infer_data_flow(
     functions: &BTreeMap<String, Utf8PathBuf>,
 ) -> Result<Vec<DataFlowEdge>> {
     let mut edges = Vec::new();
+    let function_names = functions.keys().cloned().collect::<BTreeSet<_>>();
+    let mut call_edges_seen = 0usize;
     for file in files {
         let path = source.join(&file.path);
         let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1478,18 +1518,32 @@ fn infer_data_flow(
         if file.role != "source" {
             continue;
         }
-        for (name, target_file) in functions {
-            if file.path == *target_file {
-                continue;
-            }
-            if has_call_site(&text, name) {
+        for line in text.lines() {
+            for name in function_call_names_in_line(line, &function_names) {
+                let Some(target_file) = functions.get(name) else {
+                    continue;
+                };
+                if file.path == *target_file {
+                    continue;
+                }
+                if call_edges_seen >= MAX_REPO_MAP_CALL_EDGES {
+                    continue;
+                }
                 edges.push(DataFlowEdge {
                     from: file.path.to_string(),
                     to: format!("function:{name}"),
                     evidence: "call-site heuristic".to_string(),
                 });
+                call_edges_seen += 1;
             }
         }
+    }
+    if call_edges_seen >= MAX_REPO_MAP_CALL_EDGES {
+        edges.push(DataFlowEdge {
+            from: "repo-map-normalizer".to_string(),
+            to: "call-site heuristic edges".to_string(),
+            evidence: format!("truncated after {MAX_REPO_MAP_CALL_EDGES} normalized call edges"),
+        });
     }
     edges.sort_by(|left, right| {
         (&left.from, &left.to, &left.evidence).cmp(&(&right.from, &right.to, &right.evidence))
@@ -1508,16 +1562,18 @@ fn infer_rust_mirror(
     let mut grouped: BTreeMap<String, Vec<Utf8PathBuf>> = BTreeMap::new();
     for file in files {
         if matches!(file.role.as_str(), "source" | "header") {
-            let stem = file.path.file_stem().unwrap_or("source").replace('-', "_");
-            grouped.entry(stem).or_default().push(file.path.clone());
+            grouped
+                .entry(rust_mirror_group(&file.path))
+                .or_default()
+                .push(file.path.clone());
         }
     }
     let modules = grouped
         .into_iter()
-        .map(|(stem, mirrors)| RustModulePlan {
-            rust_path: target.join(format!("src/{stem}.rs")),
+        .map(|(module, mirrors)| RustModulePlan {
+            rust_path: target.join(format!("src/{module}.rs")),
             mirrors,
-            reason: "one Rust module per source/header ownership cluster".to_string(),
+            reason: "Rust module follows source ownership and process boundary cluster".to_string(),
         })
         .collect();
     RustMirrorPlan {
@@ -1613,35 +1669,149 @@ fn write_full_picture(
     path: &Utf8Path,
     strategy: &KnowledgeStrategy,
     repo_map: &SourceRepoMap,
+    out: &Utf8Path,
+    evidence_runs: &[EvidenceRun],
 ) -> Result<()> {
     let mut text = String::new();
     text.push_str("# Full Repo Picture\n\n");
-    text.push_str(&format!("- Goal: {}\n", strategy.goal));
     text.push_str(&format!("- Source: `{}`\n", repo_map.source_repo));
     text.push_str(&format!("- Target: `{}`\n\n", repo_map.target_repo));
-    text.push_str("## Process Flow\n\n");
-    for step in &repo_map.process_flow {
-        text.push_str(&format!("- `{}`: `{}`\n", step.kind, step.label));
-    }
-    text.push_str("\n## Data Flow\n\n");
-    for edge in &repo_map.data_flow {
+
+    text.push_str("## Executive Summary\n\n");
+    text.push_str(&format!("- Goal: {}\n", strategy.goal));
+    text.push_str(&format!(
+        "- Source inventory: {} mapped files across {} roles.\n",
+        repo_map.files.len(),
+        role_counts(&repo_map.files).len()
+    ));
+    text.push_str(&format!(
+        "- Build map: {} build units from compile databases, CMake files, Makefiles, and captured build output.\n",
+        count_jsonl_rows(&out.join("facts/build_units.jsonl"))?
+    ));
+    text.push_str(&format!(
+        "- Symbol map: {} normalized symbols; process map promotes {} likely functions/entrypoints.\n",
+        count_jsonl_rows(&out.join("facts/symbols.jsonl"))?,
+        repo_map.process_flow.len()
+    ));
+    text.push_str(&format!(
+        "- Data map: {} normalized call/data edges; {} raw/semantic graph records.\n",
+        count_jsonl_rows(&out.join("facts/call_edges.jsonl"))?,
+        count_jsonl_rows(&out.join("facts/semantic_graphs.jsonl"))?
+    ));
+    text.push_str(&format!(
+        "- Rust mirror: {} source ownership clusters.\n\n",
+        repo_map.rust_mirror.modules.len()
+    ));
+
+    text.push_str("## Build System\n\n");
+    text.push_str("- Build-unit evidence is normalized from recursive `compile_commands.json`, nested `CMakeLists.txt`, Makefiles, and captured build output when available.\n");
+    text.push_str("- Clang-family AST/lint tools are run only when a compile database is discovered, so missing include paths do not become noisy false failures.\n");
+    text.push_str("- Detailed rows: `facts/build_units.jsonl`.\n\n");
+
+    text.push_str("## Tool Outcomes\n\n");
+    for run in evidence_runs {
         text.push_str(&format!(
-            "- `{}` -> `{}` via {}\n",
-            edge.from, edge.to, edge.evidence
+            "- `{}`: {}{} - {}\n",
+            run.tool,
+            run.status,
+            run.exit_code
+                .map(|code| format!(" (exit {code})"))
+                .unwrap_or_default(),
+            run.notes
         ));
     }
-    text.push_str("\n## Rust Mirror\n\n");
-    for module in &repo_map.rust_mirror.modules {
-        text.push_str(&format!("- `{}`\n", module.rust_path));
+    if evidence_runs.is_empty() {
+        text.push_str("- No raw evidence tools ran.\n");
     }
-    text.push_str("\n## Fact Tables\n\n");
+    text.push('\n');
+
+    text.push_str("## Entry Points\n\n");
+    for entrypoint in &repo_map.rust_mirror.entrypoints {
+        text.push_str(&format!("- `{entrypoint}`\n"));
+    }
+    if repo_map.rust_mirror.entrypoints.is_empty() {
+        text.push_str("- No entrypoint inferred from source scan.\n");
+    }
+    text.push('\n');
+
+    text.push_str("## Source Roles\n\n");
+    for (role, count) in role_counts(&repo_map.files) {
+        text.push_str(&format!("- `{role}`: {count}\n"));
+    }
+    text.push('\n');
+
+    text.push_str("## Major Source Subsystems\n\n");
+    for module in repo_map.rust_mirror.modules.iter().take(40) {
+        text.push_str(&format!(
+            "- `{}` mirrors {} source files",
+            module.rust_path,
+            module.mirrors.len()
+        ));
+        if let Some(first) = module.mirrors.first() {
+            text.push_str(&format!("; starts at `{first}`"));
+        }
+        text.push('\n');
+    }
+    if repo_map.rust_mirror.modules.len() > 40 {
+        text.push_str(&format!(
+            "- ... {} more mirror clusters in `RUST_MIRROR_PLAN.md`.\n",
+            repo_map.rust_mirror.modules.len() - 40
+        ));
+    }
+    text.push('\n');
+
+    text.push_str("## Data Flow Evidence\n\n");
+    for (evidence, count) in data_flow_counts(&repo_map.data_flow) {
+        text.push_str(&format!("- `{evidence}`: {count} edges\n"));
+    }
+    text.push_str("- Detailed source map: `repo-map.md` and target-side `.c-to-rust-port/SOURCE_REPO_MAP.md`.\n\n");
+
+    text.push_str("## Rust Mirror Plan\n\n");
+    text.push_str(&format!("{}\n\n", repo_map.rust_mirror.principle));
+    text.push_str("- Port modules should initially follow the source ownership clusters above.\n");
+    text.push_str("- Do not refactor across clusters until behavior parity evidence exists.\n");
+    text.push_str("- Detailed mirror plan: target-side `.c-to-rust-port/RUST_MIRROR_PLAN.md`.\n\n");
+
+    text.push_str("## Fact Tables\n\n");
     for table in &strategy.fact_tables {
         text.push_str(&format!(
-            "- `{}` keyed by `{}`: {}\n",
-            table.name, table.record_key, table.purpose
+            "- `facts/{}.jsonl`: {} rows. {}\n",
+            table.name,
+            count_jsonl_rows(&out.join(format!("facts/{}.jsonl", table.name)))?,
+            table.purpose
         ));
     }
+    text.push_str("\n## Raw Evidence\n\n");
+    text.push_str("- Tool run ledger: `raw/evidence-runs.jsonl`.\n");
+    text.push_str("- Source structure: `raw/source-structure/`.\n");
+    text.push_str("- Semantic analysis: `raw/semantic-analysis/`.\n");
+    text.push_str("- Build capture: `raw/build-capture/`.\n");
+    text.push_str("- Rust target: `raw/rust-target/`.\n");
     std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn count_jsonl_rows(path: &Utf8Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
+    Ok(std::io::BufReader::new(file).lines().count())
+}
+
+fn role_counts(files: &[RepoFile]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for file in files {
+        *counts.entry(file.role.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn data_flow_counts(edges: &[DataFlowEdge]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for edge in edges {
+        *counts.entry(edge.evidence.clone()).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn source_files(source: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
@@ -1668,12 +1838,61 @@ fn source_files(source: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
     Ok(files)
 }
 
-fn compile_units(files: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
-    files
-        .iter()
-        .filter(|path| matches!(path.extension(), Some("c" | "cc" | "cpp" | "cxx" | "C")))
-        .cloned()
-        .collect()
+fn write_cscope_file_list(path: &Utf8Path, source_files: &[Utf8PathBuf]) -> Result<()> {
+    let mut text = String::new();
+    for source_file in source_files {
+        text.push_str(source_file.as_str());
+        text.push('\n');
+    }
+    std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn compile_database_paths(source: &Utf8Path, out: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for candidate in [
+        source.join("compile_commands.json"),
+        out.join("raw/build-capture/bear/compile_commands.json"),
+        out.join("raw/build-capture/cmake-probe/compile_commands.json"),
+    ] {
+        if candidate.exists() {
+            paths.insert(candidate);
+        }
+    }
+    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = utf8_path(entry.path())?;
+        if path
+            .components()
+            .any(|component| component.as_str() == ".c2rust-port")
+        {
+            continue;
+        }
+        if path.file_name() == Some("compile_commands.json") {
+            paths.insert(path);
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn compile_database_units(paths: &[Utf8PathBuf]) -> Result<Vec<Utf8PathBuf>> {
+    let mut units = BTreeSet::new();
+    for path in paths {
+        let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+        let Ok(commands) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(items) = commands.as_array() else {
+            continue;
+        };
+        for item in items {
+            if let Some(file) = item.get("file").and_then(|value| value.as_str()) {
+                units.insert(Utf8PathBuf::from(file));
+            }
+        }
+    }
+    Ok(units.into_iter().collect())
 }
 
 fn is_source_or_build_file(path: &Utf8Path) -> bool {
@@ -1712,11 +1931,111 @@ fn function_name_from_line(line: &str) -> Option<String> {
         return None;
     }
     let before_paren = trimmed.split('(').next()?.trim();
-    let name = before_paren.split_whitespace().last()?;
-    if matches!(name, "if" | "for" | "while" | "switch") {
+    let name = before_paren
+        .split_whitespace()
+        .last()?
+        .trim_matches('*')
+        .trim_matches('&');
+    if matches!(name, "if" | "for" | "while" | "switch") || !is_function_like_identifier(name) {
         return None;
     }
-    Some(name.trim_matches('*').to_string())
+    if is_macro_like_identifier(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn is_function_like_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || matches!(first, '_' | '~')) {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '~'))
+}
+
+fn is_macro_like_identifier(name: &str) -> bool {
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    let has_lowercase = leaf.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_uppercase = leaf.chars().any(|ch| ch.is_ascii_uppercase());
+    if has_uppercase && !has_lowercase {
+        return true;
+    }
+    matches!(
+        leaf,
+        "TEST"
+            | "TEST_F"
+            | "TEST_P"
+            | "TYPED_TEST"
+            | "ACTION"
+            | "ACTION_P"
+            | "ACTION_P2"
+            | "ACTION_P3"
+            | "ACTION_P4"
+            | "ACTION_P5"
+            | "ACTION_P6"
+            | "ACTION_P7"
+            | "ACTION_P8"
+            | "ACTION_P9"
+            | "ACTION_P10"
+    )
+}
+
+fn rust_mirror_group(path: &Utf8Path) -> String {
+    let parts = path
+        .components()
+        .map(|component| component.as_str())
+        .collect::<Vec<_>>();
+    let group = match parts.as_slice() {
+        ["src", "projects", project, ..] => format!("projects/{}", rust_segment(project)),
+        ["src", "common", area, ..] => format!("common/{}", rust_segment(area)),
+        ["src", "test", area, ..] => format!("tests/{}", rust_segment(area)),
+        ["src", area, ..] => format!("source/{}", rust_segment(area)),
+        ["ext", "include", vendor, ..] | ["ext", "src", vendor, ..] => {
+            format!("vendor/{}", rust_segment(vendor))
+        }
+        ["build_spades", ..] => "generated/build_spades".to_string(),
+        [first, second, ..] => {
+            format!("{}/{}", rust_segment(first), rust_file_stem_segment(second))
+        }
+        [first] => format!("source/{}", rust_file_stem_segment(first)),
+        [] => "source/root".to_string(),
+    };
+    group
+}
+
+fn rust_file_stem_segment(input: &str) -> String {
+    Utf8Path::new(input)
+        .file_stem()
+        .map(rust_segment)
+        .unwrap_or_else(|| rust_segment(input))
+}
+
+fn rust_segment(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_underscore = false;
+    for ch in input.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '_'
+        };
+        if next == '_' && last_was_underscore {
+            continue;
+        }
+        last_was_underscore = next == '_';
+        out.push(next);
+    }
+    let out = out.trim_matches('_');
+    if out.is_empty() {
+        "source".to_string()
+    } else if out.as_bytes()[0].is_ascii_digit() {
+        format!("n_{out}")
+    } else {
+        out.to_string()
+    }
 }
 
 fn include_target(line: &str) -> Option<String> {
@@ -1730,12 +2049,53 @@ fn include_target(line: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn has_call_site(text: &str, name: &str) -> bool {
-    let needle = format!("{name}(");
-    text.lines().any(|line| {
-        let trimmed = line.trim();
-        !trimmed.starts_with('#') && trimmed.contains(&needle)
-    })
+fn function_call_names_in_line<'a>(
+    line: &'a str,
+    known_functions: &'a BTreeSet<String>,
+) -> Vec<&'a str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    for (index, _) in line.match_indices('(') {
+        let prefix = &line[..index];
+        let Some(name) = identifier_suffix(prefix) else {
+            continue;
+        };
+        if is_control_keyword(name) || !known_functions.contains(name) {
+            continue;
+        }
+        names.push(name);
+    }
+    names
+}
+
+fn identifier_suffix(text: &str) -> Option<&str> {
+    let end = text.rfind(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')? + 1;
+    let start = text[..end]
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let ident = &text[start..end];
+    (!ident.is_empty()).then_some(ident)
+}
+
+fn is_control_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "for"
+            | "while"
+            | "switch"
+            | "return"
+            | "sizeof"
+            | "catch"
+            | "static_cast"
+            | "dynamic_cast"
+            | "reinterpret_cast"
+            | "const_cast"
+    )
 }
 
 fn mermaid_id(input: &str) -> String {
@@ -1864,6 +2224,116 @@ fn parse_compile_commands(path: &Utf8Path) -> Result<Vec<serde_json::Value>> {
     Ok(rows)
 }
 
+fn parse_cmake_build_units(source: &Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for cmake in build_files(source, "CMakeLists.txt")? {
+        let relative = cmake.strip_prefix(source).unwrap_or(&cmake).to_path_buf();
+        for (line_index, line) in read_lines(&cmake)?.into_iter().enumerate() {
+            let Some((directive, target)) = parse_cmake_directive(&line) else {
+                continue;
+            };
+            let key = format!("cmake:{relative}:{line_index}:{directive}:{target}");
+            rows.push(serde_json::json!({
+                "fact_type": "build_unit",
+                "key": key,
+                "tool": "cmake",
+                "build_file": relative,
+                "line_index": line_index,
+                "directive": directive,
+                "target": target,
+                "command": line.trim(),
+                "provenance": [cmake.to_string()],
+            }));
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_makefile_build_units(source: &Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for makefile in build_files(source, "Makefile")? {
+        let relative = makefile
+            .strip_prefix(source)
+            .unwrap_or(&makefile)
+            .to_path_buf();
+        for (line_index, line) in read_lines(&makefile)?.into_iter().enumerate() {
+            let Some(target) = parse_makefile_target(&line) else {
+                continue;
+            };
+            let key = format!("make:{relative}:{line_index}:{target}");
+            rows.push(serde_json::json!({
+                "fact_type": "build_unit",
+                "key": key,
+                "tool": "makefile",
+                "build_file": relative,
+                "line_index": line_index,
+                "target": target,
+                "command": line.trim(),
+                "provenance": [makefile.to_string()],
+            }));
+        }
+    }
+    Ok(rows)
+}
+
+fn build_files(source: &Utf8Path, file_name: &str) -> Result<Vec<Utf8PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = utf8_path(entry.path())?;
+        if path
+            .components()
+            .any(|component| component.as_str() == ".c2rust-port")
+        {
+            continue;
+        }
+        if path.file_name() == Some(file_name) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn parse_cmake_directive(line: &str) -> Option<(&'static str, String)> {
+    let line = line.split('#').next()?.trim();
+    for (prefix, directive) in [
+        ("add_executable(", "add_executable"),
+        ("add_library(", "add_library"),
+        ("target_link_libraries(", "target_link_libraries"),
+        ("target_include_directories(", "target_include_directories"),
+        ("add_subdirectory(", "add_subdirectory"),
+        ("project(", "project"),
+    ] {
+        let Some(rest) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        let target = rest
+            .split(|ch: char| ch == ')' || ch.is_whitespace())
+            .find(|part| !part.is_empty())?;
+        return Some((directive, target.trim_matches('"').to_string()));
+    }
+    None
+}
+
+fn parse_makefile_target(line: &str) -> Option<String> {
+    if line.starts_with('\t') || line.trim_start().starts_with('#') {
+        return None;
+    }
+    let (target, rest) = line.split_once(':')?;
+    if target.trim().is_empty()
+        || rest.starts_with('=')
+        || target.contains('=')
+        || target.contains(' ')
+        || target.contains('\t')
+    {
+        return None;
+    }
+    Some(target.trim().to_string())
+}
+
 fn parse_ctags_line(line: &str) -> Option<serde_json::Value> {
     let mut parts = line.split_whitespace();
     let name = parts.next()?;
@@ -1932,43 +2402,67 @@ fn parse_clang_query_bind_line(line: &str) -> Option<(String, u64)> {
     Some((path.to_string(), line_number.parse().ok()?))
 }
 
-fn parse_cflow_edges(lines: &[String]) -> Vec<serde_json::Value> {
+fn parse_cflow_edges_from_path(path: &Utf8Path, max_rows: usize) -> Result<Vec<serde_json::Value>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
+    let reader = std::io::BufReader::new(file);
     let mut rows = Vec::new();
     let mut stack: Vec<(usize, String)> = Vec::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let level = line.chars().take_while(|ch| ch.is_whitespace()).count() / 4;
-        let Some(name) = trimmed
-            .split('(')
-            .next()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        else {
+    let mut truncated = false;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read {path}"))?;
+        let Some(row) = parse_cflow_line(&line, &mut stack) else {
             continue;
         };
-        while stack
-            .last()
-            .is_some_and(|(prior_level, _)| *prior_level >= level)
-        {
-            stack.pop();
+        if rows.len() >= max_rows {
+            truncated = true;
+            continue;
         }
-        if let Some((_, caller)) = stack.last() {
-            rows.push(serde_json::json!({
-                "fact_type": "call_edge",
-                "key": format!("{caller}->{name}:cflow"),
-                "caller": caller,
-                "callee": name,
-                "source_span": trimmed,
-                "evidence": "cflow",
-                "provenance": ["cflow"],
-            }));
-        }
-        stack.push((level, name.to_string()));
+        rows.push(row);
     }
-    rows
+    if truncated {
+        rows.push(serde_json::json!({
+            "fact_type": "call_edge",
+            "key": format!("cflow:truncated:{max_rows}"),
+            "caller": "cflow-normalizer",
+            "callee": "remaining raw cflow edges",
+            "source_span": null,
+            "evidence": format!("normalized cflow rows truncated after {max_rows}; raw cflow output remains preserved"),
+            "provenance": ["cflow"],
+        }));
+    }
+    Ok(rows)
+}
+
+fn parse_cflow_line(line: &str, stack: &mut Vec<(usize, String)>) -> Option<serde_json::Value> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let level = line.chars().take_while(|ch| ch.is_whitespace()).count() / 4;
+    let name = trimmed
+        .split('(')
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?;
+    while stack
+        .last()
+        .is_some_and(|(prior_level, _)| *prior_level >= level)
+    {
+        stack.pop();
+    }
+    let row = stack.last().map(|(_, caller)| {
+        serde_json::json!({
+            "fact_type": "call_edge",
+            "key": format!("{caller}->{name}:cflow"),
+            "caller": caller,
+            "callee": name,
+            "source_span": trimmed,
+            "evidence": "cflow",
+            "provenance": ["cflow"],
+        })
+    });
+    stack.push((level, name.to_string()));
+    row
 }
 
 fn normalize_codeql_sarif_diagnostics(out: &Utf8Path) -> Result<Vec<serde_json::Value>> {

@@ -85,7 +85,7 @@ fn single_command_maps_makefile_repo_without_compile_commands() {
     let mirror =
         std::fs::read_to_string(inferred_target(&root).join(".c-to-rust-port/RUST_MIRROR_PLAN.md"))
             .unwrap();
-    assert!(mirror.contains("src/math_ops.rs"));
+    assert!(mirror.contains("src/source/math_ops.rs"));
 }
 
 #[test]
