@@ -16,9 +16,14 @@ pub fn run(source: &Utf8Path, target: &Utf8Path) -> Result<()> {
     let root = target.join(".c-to-rust-port");
     std::fs::create_dir_all(root.join("units/000-source-map"))?;
     std::fs::create_dir_all(root.join("prompt_profiles"))?;
+    std::fs::create_dir_all(root.join("vllm"))?;
+    std::fs::create_dir_all(root.join("vllm_runs"))?;
     let profile = PacketProfile::default();
     profile.write_to(&root.join("prompt_profiles/translator-default.toml"))?;
     write_packet(source, target, &root.join("units/000-source-map/TASK.md"))?;
+    write_vllm_worker_system(&root.join("vllm/WORKER_SYSTEM.md"))?;
+    write_vllm_review_checklist(&root.join("vllm/REVIEW_CHECKLIST.md"))?;
+    write_vllm_runbook(&root.join("vllm/RUNBOOK.md"), &profile)?;
     let outcome = PacketOutcome {
         packet: "000-source-map".to_string(),
         status: "planned".to_string(),
@@ -59,9 +64,113 @@ fn write_packet(source: &Utf8Path, target: &Utf8Path, path: &Utf8Path) -> Result
     text.push_str("- Do not run git.\n");
     text.push_str("- Do not run Cargo, builds, benchmarks, package managers, or broad scans.\n");
     text.push_str("- Do not edit the shared worktree.\n");
-    text.push_str("- Produce a draft patch and notes only.\n\n");
+    text.push_str("- Produce a draft patch and notes only.\n");
+    text.push_str("- Use only the context in this packet and the named target file excerpts.\n");
+    text.push_str("- If context is insufficient, return the smallest useful skeleton and list the missing excerpts.\n\n");
+    text.push_str("## Patch Contract\n");
+    text.push_str("- Output one unified diff, then an `Assumptions` section.\n");
+    text.push_str("- Do not mark an existing file as `new file mode`.\n");
+    text.push_str(
+        "- Do not add modules unless the target file list explicitly names the module file.\n",
+    );
+    text.push_str(
+        "- Do not remove existing public items unless the task explicitly asks for removal.\n",
+    );
+    text.push_str("- Do not use crates that are not already in `Cargo.toml`.\n");
+    text.push_str(
+        "- Preserve source enum order, integer discriminants, and public naming evidence.\n",
+    );
+    text.push_str(
+        "- Prefer allocation-free constants/slices over maps unless keyed lookup is required.\n\n",
+    );
     text.push_str("## Allowed Verification Command\n");
     text.push_str("None for translator packets. Apply/converge packets own verification.\n");
+    std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn write_vllm_worker_system(path: &Utf8Path) -> Result<()> {
+    let mut text = String::new();
+    text.push_str("# Local vLLM Worker System Prompt\n\n");
+    text.push_str("You are a local translation worker for a C/C++ to Rust port.\n\n");
+    text.push_str("## Hard Rules\n\n");
+    text.push_str("- Do not run commands.\n");
+    text.push_str("- Do not use git.\n");
+    text.push_str(
+        "- Do not run Cargo, builds, tests, benchmarks, package managers, or broad scans.\n",
+    );
+    text.push_str("- Do not claim verification.\n");
+    text.push_str("- Do not inspect the filesystem beyond the packet content.\n");
+    text.push_str(
+        "- Use only the source excerpts, target excerpts, and architecture notes in the packet.\n",
+    );
+    text.push_str("- Return one proposed unified diff, then a short `Assumptions` section.\n");
+    text.push_str("- If the packet is insufficient, return the smallest useful skeleton and name the missing excerpts.\n\n");
+    text.push_str("## Patch Rules\n\n");
+    text.push_str("- Existing files must be patched as existing files, not `new file mode`.\n");
+    text.push_str("- New files are allowed only when listed in the packet target files.\n");
+    text.push_str("- Do not introduce dependencies.\n");
+    text.push_str("- Keep changes narrow and behavior-preserving.\n");
+    std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn write_vllm_review_checklist(path: &Utf8Path) -> Result<()> {
+    let mut text = String::new();
+    text.push_str("# vLLM Draft Review Checklist\n\n");
+    text.push_str("A Codex controller or apply/converge agent must reject a worker draft when any item fails.\n\n");
+    text.push_str("## Safety\n\n");
+    text.push_str("- [ ] Draft does not claim it ran commands.\n");
+    text.push_str("- [ ] Draft does not mention Cargo/git/build/test output.\n");
+    text.push_str("- [ ] Draft touches only target files named by the packet.\n");
+    text.push_str("- [ ] Existing files are not marked as new files.\n");
+    text.push_str("- [ ] No new dependencies or package-manager instructions appear.\n\n");
+    text.push_str("## Source Fidelity\n\n");
+    text.push_str(
+        "- [ ] Every public enum preserves source variant order and explicit discriminants.\n",
+    );
+    text.push_str("- [ ] Helper functions mirror source branch behavior visible in the packet.\n");
+    text.push_str("- [ ] Missing behavior is listed as an assumption, not silently invented.\n");
+    text.push_str("- [ ] Names are traceable to source names or target architecture docs.\n\n");
+    text.push_str("## Rust Fit\n\n");
+    text.push_str("- [ ] Types derive traits required by their own use sites.\n");
+    text.push_str("- [ ] Constants/slices are preferred over heap maps for ordered name tables.\n");
+    text.push_str("- [ ] The patch is small enough for one apply/converge verification cycle.\n");
+    std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn write_vllm_runbook(path: &Utf8Path, profile: &PacketProfile) -> Result<()> {
+    let mut text = String::new();
+    text.push_str("# Local vLLM Runbook\n\n");
+    text.push_str("Use Codex as the controller and local vLLM as a draft-only worker.\n\n");
+    text.push_str("## Flow\n\n");
+    text.push_str("1. Codex selects one small `units/*/TASK.md` packet.\n");
+    text.push_str("2. Codex prepends `vllm/WORKER_SYSTEM.md`.\n");
+    text.push_str(
+        "3. Codex sends the bounded prompt to the local OpenAI-compatible vLLM endpoint.\n",
+    );
+    text.push_str(
+        "4. Save `request.json`, `response.json`, and `draft.md` under `vllm_runs/<packet>/`.\n",
+    );
+    text.push_str("5. Review with `vllm/REVIEW_CHECKLIST.md`.\n");
+    text.push_str("6. Only apply/converge may edit files or run verification.\n\n");
+    text.push_str("## Default Profile\n\n");
+    text.push_str(&format!(
+        "- Max prompt bytes: `{}`\n",
+        profile.max_prompt_bytes
+    ));
+    text.push_str(&format!(
+        "- Max completion tokens: `{}`\n",
+        profile.max_completion_tokens
+    ));
+    text.push_str(&format!(
+        "- Require review before apply: `{}`\n",
+        profile.require_review_before_apply
+    ));
+    text.push_str(&format!(
+        "- Allow verification in worker: `{}`\n",
+        profile.allow_verification
+    ));
+    text.push_str("\n## Local Endpoint\n\n");
+    text.push_str("The controller may use an OpenAI-compatible endpoint such as `http://127.0.0.1:8000/v1/chat/completions` when available. The endpoint is local configuration, not a public repo default.\n");
     std::fs::write(path, text).with_context(|| format!("write {path}"))
 }
 

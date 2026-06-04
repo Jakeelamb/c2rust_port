@@ -140,6 +140,22 @@ fn single_command_packets_include_cpp_headers_and_restrictions() {
     assert!(task.contains("Do not run Cargo"));
     assert!(task.contains("SOURCE_REPO_MAP.md"));
     assert!(task.contains("RUST_MIRROR_PLAN.md"));
+    assert!(task.contains("Patch Contract"));
+    assert!(task.contains("Do not mark an existing file as `new file mode`"));
+    let worker_system =
+        std::fs::read_to_string(target.join(".c-to-rust-port/vllm/WORKER_SYSTEM.md")).unwrap();
+    let review_checklist =
+        std::fs::read_to_string(target.join(".c-to-rust-port/vllm/REVIEW_CHECKLIST.md")).unwrap();
+    let runbook = std::fs::read_to_string(target.join(".c-to-rust-port/vllm/RUNBOOK.md")).unwrap();
+    let profile = std::fs::read_to_string(
+        target.join(".c-to-rust-port/prompt_profiles/translator-default.toml"),
+    )
+    .unwrap();
+    assert!(worker_system.contains("Do not run commands"));
+    assert!(review_checklist.contains("Existing files are not marked as new files"));
+    assert!(runbook.contains("draft-only worker"));
+    assert!(profile.contains("require_review_before_apply = true"));
+    assert!(profile.contains("forbidden_commands"));
 }
 
 #[test]
