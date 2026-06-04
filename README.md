@@ -42,6 +42,9 @@ Source repo outputs:
 - `.c2rust-port/bench/runs/*.jsonl`
 - `.c2rust-port/knowledge/knowledge-strategy.json`
 - `.c2rust-port/knowledge/KNOWLEDGE.md`
+- `.c2rust-port/knowledge/repo-map.json`
+- `.c2rust-port/knowledge/repo-map.md`
+- `.c2rust-port/knowledge/raw/evidence-runs.jsonl`
 - `.c2rust-port/knowledge/raw/**`
 - `.c2rust-port/knowledge/facts/*.jsonl`
 - `.c2rust-port/knowledge/bundles/full-picture.md`
@@ -50,6 +53,8 @@ Target repo outputs:
 
 - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `README.md`, `PORTING.md`, `GOAL.md` when missing
 - `.c-to-rust-port/STATUS.md`
+- `.c-to-rust-port/SOURCE_REPO_MAP.md`
+- `.c-to-rust-port/RUST_MIRROR_PLAN.md`
 - `.c-to-rust-port/agents/*.md`
 - `.c-to-rust-port/units/*/TASK.md`
 - `.c-to-rust-port/prompt_profiles/*.toml`
@@ -78,6 +83,13 @@ The fact tables are:
 - `coverage`
 - `benchmarks`
 - `rust_workspace`
+- `repo_map`
+
+The source repo map records:
+
+- Process flow: entrypoints and functions with source locations.
+- Data flow: include edges and call edges with evidence labels.
+- Rust mirror plan: initial Rust module paths that mirror source ownership/process boundaries before refactoring.
 
 ## Tool Audit
 

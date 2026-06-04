@@ -19,8 +19,22 @@ fn inferred_target(source: &camino::Utf8Path) -> camino::Utf8PathBuf {
 #[test]
 fn single_command_maps_makefile_repo_without_compile_commands() {
     let root = fixture_root("make");
-    std::fs::write(root.join("main.c"), "int main(void) { return 0; }\n").unwrap();
-    std::fs::write(root.join("Makefile"), "all:\n\tcc main.c -o main\n").unwrap();
+    std::fs::write(root.join("math_ops.h"), "int add(int lhs, int rhs);\n").unwrap();
+    std::fs::write(
+        root.join("math_ops.c"),
+        "#include \"math_ops.h\"\n\nint add(int lhs, int rhs) {\n    return lhs + rhs;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.c"),
+        "#include \"math_ops.h\"\n\nint main(void) {\n    return add(2, 3);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Makefile"),
+        "all:\n\tcc main.c math_ops.c -o main\n",
+    )
+    .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_c2rust-port"))
         .arg(&root)
@@ -44,6 +58,16 @@ fn single_command_maps_makefile_repo_without_compile_commands() {
             .join(".c-to-rust-port/units/000-source-map/TASK.md")
             .exists()
     );
+    assert!(root.join(".c2rust-port/knowledge/repo-map.json").exists());
+    let repo_map =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/repo-map.md")).unwrap();
+    assert!(repo_map.contains("## Process Flow"));
+    assert!(repo_map.contains("## Data Flow"));
+    assert!(repo_map.contains("add"));
+    let mirror =
+        std::fs::read_to_string(inferred_target(&root).join(".c-to-rust-port/RUST_MIRROR_PLAN.md"))
+            .unwrap();
+    assert!(mirror.contains("src/math_ops.rs"));
 }
 
 #[test]
@@ -96,6 +120,8 @@ fn single_command_packets_include_cpp_headers_and_restrictions() {
         .unwrap();
     assert!(task.contains("widget.hpp"));
     assert!(task.contains("Do not run Cargo"));
+    assert!(task.contains("SOURCE_REPO_MAP.md"));
+    assert!(task.contains("RUST_MIRROR_PLAN.md"));
 }
 
 #[test]

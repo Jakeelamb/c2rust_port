@@ -37,7 +37,15 @@ fn write_packet(source: &Utf8Path, target: &Utf8Path, path: &Utf8Path) -> Result
     let mut text = String::new();
     text.push_str("# TASK: Source Map Bootstrap\n\n");
     text.push_str("## Scope\n");
-    text.push_str("Draft a narrow Rust porting plan for the listed source slice only.\n\n");
+    text.push_str("Draft a narrow Rust porting plan for the listed source slice only. Preserve the process and data-flow boundaries from the generated repo map.\n\n");
+    text.push_str("## Required Context\n");
+    text.push_str(
+        "- Read `.c-to-rust-port/SOURCE_REPO_MAP.md` for source process flow and data flow.\n",
+    );
+    text.push_str(
+        "- Read `.c-to-rust-port/RUST_MIRROR_PLAN.md` for the initial Rust module layout.\n",
+    );
+    text.push_str("- Do not invent a different module structure unless the map evidence is wrong and you document why.\n\n");
     text.push_str("## Source Slice\n");
     for file in &files {
         text.push_str(&format!("- `{file}`\n"));
