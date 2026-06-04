@@ -64,6 +64,24 @@ fn single_command_maps_makefile_repo_without_compile_commands() {
     assert!(repo_map.contains("## Process Flow"));
     assert!(repo_map.contains("## Data Flow"));
     assert!(repo_map.contains("add"));
+    let symbols =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/symbols.jsonl")).unwrap();
+    let calls = std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/call_edges.jsonl"))
+        .unwrap();
+    let build_units =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/build_units.jsonl"))
+            .unwrap();
+    let repo_map_facts =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/repo_map.jsonl")).unwrap();
+    let benchmarks =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/benchmarks.jsonl"))
+            .unwrap();
+    assert!(symbols.contains("\"name\":\"add\""));
+    assert!(calls.contains("\"callee\":\"add\""));
+    assert!(build_units.contains("math_ops.c"));
+    assert!(repo_map_facts.contains("rust_mirror_module"));
+    assert!(benchmarks.contains("benchmark_manifest"));
+    assert!(benchmarks.contains("benchmark_run"));
     let mirror =
         std::fs::read_to_string(inferred_target(&root).join(".c-to-rust-port/RUST_MIRROR_PLAN.md"))
             .unwrap();

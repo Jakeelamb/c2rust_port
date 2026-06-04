@@ -24,9 +24,9 @@ Each run does the same phases:
 1. Resolve source and target paths.
 2. Create the target scaffold if it is missing.
 3. Inspect the source repo.
-4. Generate the knowledge-base strategy and consolidation skeleton.
-5. Prepare tiny, smoke, medium, and large benchmark manifests.
-6. Run source-build probe evidence.
+4. Prepare tiny, smoke, medium, and large benchmark manifests.
+5. Run source-build probe evidence.
+6. Generate the knowledge base, raw evidence, normalized facts, repo map, and consolidation bundle.
 7. Generate bounded translator packets in the target repo.
 
 ## Outputs
@@ -84,6 +84,8 @@ The fact tables are:
 - `benchmarks`
 - `rust_workspace`
 - `repo_map`
+
+Current normalizers populate these tables from repo walk, compile database or `make -n`, `ctags`, `cflow`, compiler/linter output, benchmark manifests/runs, cargo metadata/check output, and the generated repo map. Tracing-aware normalizers are already wired: `strace`/`ltrace`/debugger output normalizes to `runtime_events`, profiler output normalizes to `profiles`, and coverage output normalizes to `coverage` when those raw evidence runners are enabled.
 
 The source repo map records:
 

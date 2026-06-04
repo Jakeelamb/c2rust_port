@@ -144,6 +144,7 @@ pub fn run(source: &Utf8Path, target: &Utf8Path) -> Result<()> {
     let evidence_runs = collect_raw_evidence(source, target, &out, &strategy)?;
     write_jsonl(&out.join("raw/evidence-runs.jsonl"), &evidence_runs)?;
     let repo_map = build_repo_map(source, target)?;
+    normalize_facts(source, target, &out, &repo_map, &evidence_runs)?;
     write_json(&out.join("repo-map.json"), &repo_map)?;
     write_repo_map_markdown(&out.join("repo-map.md"), &repo_map)?;
     write_mirror_docs(target, &repo_map)?;
@@ -768,6 +769,463 @@ fn build_repo_map(source: &Utf8Path, target: &Utf8Path) -> Result<SourceRepoMap>
     })
 }
 
+fn normalize_facts(
+    source: &Utf8Path,
+    target: &Utf8Path,
+    out: &Utf8Path,
+    repo_map: &SourceRepoMap,
+    evidence_runs: &[EvidenceRun],
+) -> Result<()> {
+    write_jsonl_values(
+        &out.join("facts/files.jsonl"),
+        &normalize_file_facts(&repo_map.files),
+    )?;
+    write_jsonl_values(
+        &out.join("facts/build_units.jsonl"),
+        &normalize_build_units(source, out, evidence_runs)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/symbols.jsonl"),
+        &normalize_symbols(out, repo_map)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/call_edges.jsonl"),
+        &normalize_call_edges(out, repo_map)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/diagnostics.jsonl"),
+        &normalize_diagnostics(out, evidence_runs)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/runtime_events.jsonl"),
+        &normalize_runtime_events(out, evidence_runs)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/profiles.jsonl"),
+        &normalize_profiles(out, evidence_runs)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/coverage.jsonl"),
+        &normalize_coverage(out, evidence_runs)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/benchmarks.jsonl"),
+        &normalize_benchmarks(source)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/rust_workspace.jsonl"),
+        &normalize_rust_workspace(target, out)?,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/repo_map.jsonl"),
+        &normalize_repo_map(repo_map),
+    )?;
+    Ok(())
+}
+
+fn normalize_file_facts(files: &[RepoFile]) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "fact_type": "file",
+                "key": file.path.to_string(),
+                "path": file.path,
+                "role": file.role,
+                "bytes": file.bytes,
+                "sha256": file.sha256,
+                "provenance": ["repo_walk"],
+            })
+        })
+        .collect()
+}
+
+fn normalize_build_units(
+    source: &Utf8Path,
+    out: &Utf8Path,
+    evidence_runs: &[EvidenceRun],
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    let compile_commands = source.join("compile_commands.json");
+    if compile_commands.exists() {
+        let text = std::fs::read_to_string(&compile_commands)
+            .with_context(|| format!("read {compile_commands}"))?;
+        if let Ok(commands) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(items) = commands.as_array() {
+                for item in items {
+                    let command = item
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .or_else(|| {
+                            item.get("arguments").map(|value| {
+                                value
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|part| part.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                        })
+                        .unwrap_or_default();
+                    rows.push(serde_json::json!({
+                        "fact_type": "build_unit",
+                        "key": sha256_hex(command.as_bytes()),
+                        "tool": "compile_commands.json",
+                        "file": item.get("file"),
+                        "directory": item.get("directory"),
+                        "command": command,
+                        "provenance": [compile_commands.to_string()],
+                    }));
+                }
+            }
+        }
+    }
+    for run in evidence_runs.iter().filter(|run| run.tool == "make") {
+        for (index, line) in read_lines(&run.stdout_path)?.into_iter().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "fact_type": "build_unit",
+                "key": sha256_hex(line.as_bytes()),
+                "tool": "make",
+                "line_index": index,
+                "command": line,
+                "provenance": [run.stdout_path],
+            }));
+        }
+    }
+    rows.sort_by_key(|row| {
+        row.get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    rows.dedup_by(|left, right| left.get("key") == right.get("key"));
+    let _ = out;
+    Ok(rows)
+}
+
+fn normalize_symbols(out: &Utf8Path, repo_map: &SourceRepoMap) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for step in &repo_map.process_flow {
+        rows.push(serde_json::json!({
+            "fact_type": "symbol",
+            "key": format!("source:{}:{}", step.source, step.label),
+            "name": step.label,
+            "kind": step.kind,
+            "path": step.source,
+            "line": null,
+            "signature": null,
+            "provenance": ["repo_map"],
+        }));
+    }
+    let ctags = out.join("raw/source-structure/ctags/stdout.txt");
+    if ctags.exists() {
+        for line in read_lines(&ctags)? {
+            if let Some(symbol) = parse_ctags_line(&line) {
+                rows.push(symbol);
+            }
+        }
+    }
+    rows.sort_by_key(|row| {
+        row.get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    rows.dedup_by(|left, right| left.get("key") == right.get("key"));
+    Ok(rows)
+}
+
+fn normalize_call_edges(
+    out: &Utf8Path,
+    repo_map: &SourceRepoMap,
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for edge in repo_map
+        .data_flow
+        .iter()
+        .filter(|edge| edge.to.starts_with("function:"))
+    {
+        rows.push(serde_json::json!({
+            "fact_type": "call_edge",
+            "key": format!("{}->{}", edge.from, edge.to),
+            "caller": edge.from,
+            "callee": edge.to.trim_start_matches("function:"),
+            "source_span": null,
+            "evidence": edge.evidence,
+            "provenance": ["repo_map"],
+        }));
+    }
+    let cflow = out.join("raw/source-structure/cflow/stdout.txt");
+    if cflow.exists() {
+        rows.extend(parse_cflow_edges(&read_lines(&cflow)?));
+    }
+    rows.sort_by_key(|row| {
+        row.get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    rows.dedup_by(|left, right| left.get("key") == right.get("key"));
+    Ok(rows)
+}
+
+fn normalize_diagnostics(
+    _out: &Utf8Path,
+    evidence_runs: &[EvidenceRun],
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for run in evidence_runs
+        .iter()
+        .filter(|run| matches!(run.tool.as_str(), "clang" | "clang-tidy" | "cargo-check"))
+    {
+        let mut lines = read_lines(&run.stdout_path)?;
+        lines.extend(read_lines(&run.stderr_path)?);
+        for (index, line) in lines.into_iter().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "fact_type": "diagnostic",
+                "key": format!("{}:{}:{}", run.tool, index, sha256_hex(line.as_bytes())),
+                "tool": run.tool,
+                "line_index": index,
+                "message": line,
+                "status": run.status,
+                "provenance": [run.stdout_path, run.stderr_path],
+            }));
+        }
+    }
+    Ok(rows)
+}
+
+fn normalize_runtime_events(
+    _out: &Utf8Path,
+    evidence_runs: &[EvidenceRun],
+) -> Result<Vec<serde_json::Value>> {
+    normalize_stream_lines(
+        evidence_runs,
+        &["strace", "ltrace", "rr", "gdb", "lldb"],
+        "runtime_event",
+    )
+}
+
+fn normalize_profiles(
+    _out: &Utf8Path,
+    evidence_runs: &[EvidenceRun],
+) -> Result<Vec<serde_json::Value>> {
+    normalize_stream_lines(
+        evidence_runs,
+        &[
+            "perf",
+            "valgrind",
+            "callgrind_annotate",
+            "gprof",
+            "cargo-flamegraph",
+            "cargo-bloat",
+        ],
+        "profile",
+    )
+}
+
+fn normalize_coverage(
+    _out: &Utf8Path,
+    evidence_runs: &[EvidenceRun],
+) -> Result<Vec<serde_json::Value>> {
+    normalize_stream_lines(
+        evidence_runs,
+        &["gcov", "llvm-cov", "lcov", "cargo-llvm-cov"],
+        "coverage",
+    )
+}
+
+fn normalize_stream_lines(
+    evidence_runs: &[EvidenceRun],
+    tools: &[&str],
+    fact_type: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for run in evidence_runs
+        .iter()
+        .filter(|run| tools.contains(&run.tool.as_str()))
+    {
+        let mut lines = read_lines(&run.stdout_path)?;
+        lines.extend(read_lines(&run.stderr_path)?);
+        for (index, line) in lines.into_iter().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "fact_type": fact_type,
+                "key": format!("{}:{}:{}", run.tool, index, sha256_hex(line.as_bytes())),
+                "tool": run.tool,
+                "line_index": index,
+                "line": line,
+                "status": run.status,
+                "provenance": [run.stdout_path, run.stderr_path],
+            }));
+        }
+    }
+    Ok(rows)
+}
+
+fn normalize_benchmarks(source: &Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    let manifest_dir = source.join(".c2rust-port/bench/manifests");
+    if manifest_dir.is_dir() {
+        for entry in
+            std::fs::read_dir(&manifest_dir).with_context(|| format!("read {manifest_dir}"))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = utf8_path(&entry.path())?;
+            let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+            let value = serde_json::from_str::<serde_json::Value>(&text)
+                .with_context(|| format!("parse {path}"))?;
+            let key = format!(
+                "manifest:{}:{}",
+                value
+                    .get("dataset_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                value
+                    .get("subset")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+            );
+            rows.push(serde_json::json!({
+                "fact_type": "benchmark_manifest",
+                "key": key,
+                "manifest": value,
+                "provenance": [path.to_string()],
+            }));
+        }
+    }
+    let run_dir = source.join(".c2rust-port/bench/runs");
+    if run_dir.is_dir() {
+        for entry in std::fs::read_dir(&run_dir).with_context(|| format!("read {run_dir}"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = utf8_path(&entry.path())?;
+            for (index, line) in read_lines(&path)?.into_iter().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value = serde_json::from_str::<serde_json::Value>(&line)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": line }));
+                rows.push(serde_json::json!({
+                    "fact_type": "benchmark_run",
+                    "key": format!("run:{}:{index}", path.file_name().unwrap_or("unknown")),
+                    "run": value,
+                    "provenance": [path.to_string()],
+                }));
+            }
+        }
+    }
+    rows.sort_by_key(|row| {
+        row.get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    Ok(rows)
+}
+
+fn normalize_rust_workspace(target: &Utf8Path, out: &Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    let metadata_path = out.join("raw/rust-target/cargo-metadata/stdout.txt");
+    if metadata_path.exists() {
+        let text = std::fs::read_to_string(&metadata_path)
+            .with_context(|| format!("read {metadata_path}"))?;
+        if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(packages) = metadata.get("packages").and_then(|value| value.as_array()) {
+                for package in packages {
+                    let package_name = package
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    rows.push(serde_json::json!({
+                        "fact_type": "rust_package",
+                        "key": format!("package:{package_name}"),
+                        "package": package_name,
+                        "manifest_path": package.get("manifest_path"),
+                        "provenance": [metadata_path.to_string()],
+                    }));
+                    if let Some(targets) = package.get("targets").and_then(|value| value.as_array())
+                    {
+                        for target_value in targets {
+                            let target_name = target_value
+                                .get("name")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown");
+                            rows.push(serde_json::json!({
+                                "fact_type": "rust_target",
+                                "key": format!("{package_name}:{target_name}"),
+                                "package": package_name,
+                                "target": target_name,
+                                "kind": target_value.get("kind"),
+                                "src_path": target_value.get("src_path"),
+                                "provenance": [metadata_path.to_string()],
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    } else if target.join("Cargo.toml").exists() {
+        rows.push(serde_json::json!({
+            "fact_type": "rust_workspace",
+            "key": "workspace:unparsed",
+            "manifest_path": target.join("Cargo.toml"),
+            "provenance": ["Cargo.toml"],
+        }));
+    }
+    Ok(rows)
+}
+
+fn normalize_repo_map(repo_map: &SourceRepoMap) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for step in &repo_map.process_flow {
+        rows.push(serde_json::json!({
+            "fact_type": "repo_map_node",
+            "key": step.id,
+            "label": step.label,
+            "source": step.source,
+            "kind": step.kind,
+            "provenance": ["repo_map"],
+        }));
+    }
+    for edge in &repo_map.data_flow {
+        rows.push(serde_json::json!({
+            "fact_type": "repo_map_edge",
+            "key": format!("{}->{}:{}", edge.from, edge.to, edge.evidence),
+            "from": edge.from,
+            "to": edge.to,
+            "evidence": edge.evidence,
+            "provenance": ["repo_map"],
+        }));
+    }
+    for module in &repo_map.rust_mirror.modules {
+        rows.push(serde_json::json!({
+            "fact_type": "rust_mirror_module",
+            "key": module.rust_path.to_string(),
+            "rust_path": module.rust_path,
+            "mirrors": module.mirrors,
+            "reason": module.reason,
+            "provenance": ["repo_map"],
+        }));
+    }
+    rows
+}
+
 fn repo_files(source: &Utf8Path) -> Result<Vec<RepoFile>> {
     let mut files = Vec::new();
     for entry in WalkDir::new(source).into_iter().filter_map(Result::ok) {
@@ -1141,6 +1599,82 @@ fn write_jsonl<T: Serialize>(path: &Utf8Path, rows: &[T]) -> Result<()> {
         text.push('\n');
     }
     std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn write_jsonl_values(path: &Utf8Path, rows: &[serde_json::Value]) -> Result<()> {
+    let mut text = String::new();
+    for row in rows {
+        text.push_str(&serde_json::to_string(row)?);
+        text.push('\n');
+    }
+    std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn read_lines(path: impl AsRef<std::path::Path>) -> Result<Vec<String>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text.lines().map(ToString::to_string).collect())
+}
+
+fn parse_ctags_line(line: &str) -> Option<serde_json::Value> {
+    let mut parts = line.split_whitespace();
+    let name = parts.next()?;
+    let kind = parts.next()?;
+    let line_number = parts.next()?.parse::<u64>().ok();
+    let path = parts.next()?;
+    let signature = line.split(path).nth(1).map(str::trim).unwrap_or("");
+    Some(serde_json::json!({
+        "fact_type": "symbol",
+        "key": format!("{path}:{name}:{}", line_number.unwrap_or(0)),
+        "name": name,
+        "kind": kind,
+        "path": path,
+        "line": line_number,
+        "signature": signature,
+        "provenance": ["ctags"],
+    }))
+}
+
+fn parse_cflow_edges(lines: &[String]) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let level = line.chars().take_while(|ch| ch.is_whitespace()).count() / 4;
+        let Some(name) = trimmed
+            .split('(')
+            .next()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        while stack
+            .last()
+            .is_some_and(|(prior_level, _)| *prior_level >= level)
+        {
+            stack.pop();
+        }
+        if let Some((_, caller)) = stack.last() {
+            rows.push(serde_json::json!({
+                "fact_type": "call_edge",
+                "key": format!("{caller}->{name}:cflow"),
+                "caller": caller,
+                "callee": name,
+                "source_span": trimmed,
+                "evidence": "cflow",
+                "provenance": ["cflow"],
+            }));
+        }
+        stack.push((level, name.to_string()));
+    }
+    rows
 }
 
 #[cfg(test)]

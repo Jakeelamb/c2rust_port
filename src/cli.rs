@@ -17,9 +17,9 @@ pub fn run(cli: Cli) -> Result<()> {
     let plan = init::resolve_repo_plan(&cli.repo)?;
     init::apply_init(&plan)?;
     inspect::run(&plan.source_repo)?;
-    knowledge::run(&plan.source_repo, &plan.target_repo)?;
     bench::prepare(&plan.source_repo)?;
     bench::run_source(&plan.source_repo)?;
+    knowledge::run(&plan.source_repo, &plan.target_repo)?;
     packets::run(&plan.source_repo, &plan.target_repo)?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
