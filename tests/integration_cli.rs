@@ -9,14 +9,20 @@ fn fixture_root(name: &str) -> camino::Utf8PathBuf {
     root
 }
 
+fn inferred_target(source: &camino::Utf8Path) -> camino::Utf8PathBuf {
+    source
+        .parent()
+        .unwrap()
+        .join(format!("{}-rs", source.file_name().unwrap()))
+}
+
 #[test]
-fn inspect_makefile_repo_without_compile_commands() {
+fn single_command_maps_makefile_repo_without_compile_commands() {
     let root = fixture_root("make");
     std::fs::write(root.join("main.c"), "int main(void) { return 0; }\n").unwrap();
     std::fs::write(root.join("Makefile"), "all:\n\tcc main.c -o main\n").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_c2rust-port"))
-        .arg("inspect")
         .arg(&root)
         .output()
         .unwrap();
@@ -33,10 +39,15 @@ fn inspect_makefile_repo_without_compile_commands() {
         root.join(".c2rust-port/inspect/diagnostic-runs.jsonl")
             .exists()
     );
+    assert!(
+        inferred_target(&root)
+            .join(".c-to-rust-port/units/000-source-map/TASK.md")
+            .exists()
+    );
 }
 
 #[test]
-fn inspect_cmake_repo_with_compile_commands() {
+fn single_command_maps_cmake_repo_with_compile_commands() {
     let root = fixture_root("cmake");
     std::fs::write(root.join("main.c"), "int main(void) { return 0; }\n").unwrap();
     std::fs::write(
@@ -47,7 +58,6 @@ fn inspect_cmake_repo_with_compile_commands() {
     std::fs::write(root.join("compile_commands.json"), "[]\n").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_c2rust-port"))
-        .arg("inspect")
         .arg(&root)
         .output()
         .unwrap();
@@ -63,10 +73,8 @@ fn inspect_cmake_repo_with_compile_commands() {
 }
 
 #[test]
-fn packets_include_cpp_headers_and_restrictions() {
+fn single_command_packets_include_cpp_headers_and_restrictions() {
     let source = fixture_root("cpp-source");
-    let target = fixture_root("cpp-target");
-    std::fs::create_dir_all(target.join("src")).unwrap();
     std::fs::write(
         source.join("widget.hpp"),
         "template <class T> T id(T value) { return value; }\n",
@@ -75,9 +83,7 @@ fn packets_include_cpp_headers_and_restrictions() {
     std::fs::write(source.join("widget.cpp"), "#include \"widget.hpp\"\n").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_c2rust-port"))
-        .arg("packets")
         .arg(&source)
-        .arg(&target)
         .output()
         .unwrap();
     assert!(
@@ -85,6 +91,7 @@ fn packets_include_cpp_headers_and_restrictions() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let target = inferred_target(&source);
     let task = std::fs::read_to_string(target.join(".c-to-rust-port/units/000-source-map/TASK.md"))
         .unwrap();
     assert!(task.contains("widget.hpp"));
@@ -92,17 +99,19 @@ fn packets_include_cpp_headers_and_restrictions() {
 }
 
 #[test]
-fn init_vendored_source_layout_is_dry_by_default() {
+fn single_command_detects_vendored_source_layout() {
     let root = fixture_root("vendored");
     let source = root.join("spades-rs/reference/upstream/SPAdes-4.2.0");
     let target = root.join("spades-rs");
     std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        target.join("Cargo.toml"),
+        "[package]\nname = \"spades-rs\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(target.join("src")).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_c2rust-port"))
-        .arg("init")
-        .arg("--source")
-        .arg(&source)
-        .arg("--target")
         .arg(&target)
         .output()
         .unwrap();
@@ -111,7 +120,11 @@ fn init_vendored_source_layout_is_dry_by_default() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!target.join("Cargo.toml").exists());
+    assert!(
+        target
+            .join(".c-to-rust-port/units/000-source-map/TASK.md")
+            .exists()
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("SPAdes-4.2.0"));
+    assert!(stdout.contains("VendoredSource"));
 }

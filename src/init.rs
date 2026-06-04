@@ -1,14 +1,19 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
 
-use crate::cli::InitArgs;
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InitPlan {
+    pub input_repo: Utf8PathBuf,
     pub source_repo: Utf8PathBuf,
     pub target_repo: Utf8PathBuf,
-    pub apply: bool,
+    pub layout: PortLayout,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum PortLayout {
+    SeparateSourceTarget,
+    VendoredSource,
 }
 
 pub fn default_target_for_source(source: &Utf8Path) -> Result<Utf8PathBuf> {
@@ -20,36 +25,25 @@ pub fn default_target_for_source(source: &Utf8Path) -> Result<Utf8PathBuf> {
     Ok(parent.join(format!("{name}-rs")))
 }
 
-pub fn resolve_init_plan(args: &InitArgs) -> Result<InitPlan> {
-    let source = args
-        .source
-        .clone()
-        .or_else(|| args.source_repo.clone())
-        .context("init requires a source path")?;
-    if args.apply && args.dry_run {
-        bail!("--apply and --dry-run are mutually exclusive");
+pub fn resolve_repo_plan(input: &Utf8Path) -> Result<InitPlan> {
+    if let Some(source) = detect_vendored_source(input)? {
+        return Ok(InitPlan {
+            input_repo: input.to_path_buf(),
+            source_repo: source,
+            target_repo: input.to_path_buf(),
+            layout: PortLayout::VendoredSource,
+        });
     }
-    let target = match &args.target {
-        Some(target) => target.clone(),
-        None => default_target_for_source(&source)?,
-    };
+
     Ok(InitPlan {
-        source_repo: source,
-        target_repo: target,
-        apply: args.apply,
+        input_repo: input.to_path_buf(),
+        source_repo: input.to_path_buf(),
+        target_repo: default_target_for_source(input)?,
+        layout: PortLayout::SeparateSourceTarget,
     })
 }
 
-pub fn run(args: InitArgs) -> Result<()> {
-    let plan = resolve_init_plan(&args)?;
-    if plan.apply {
-        apply_init(&plan)?;
-    }
-    println!("{}", serde_json::to_string_pretty(&plan)?);
-    Ok(())
-}
-
-fn apply_init(plan: &InitPlan) -> Result<()> {
+pub fn apply_init(plan: &InitPlan) -> Result<()> {
     std::fs::create_dir_all(plan.target_repo.join("src"))
         .with_context(|| format!("create {}", plan.target_repo))?;
     std::fs::create_dir_all(plan.target_repo.join(".c-to-rust-port/agents"))?;
@@ -105,6 +99,25 @@ fn write_new(path: &Utf8Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("write {path}"))
 }
 
+fn detect_vendored_source(input: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
+    let upstream = input.join("reference/upstream");
+    if !input.join("Cargo.toml").exists() || !upstream.is_dir() {
+        return Ok(None);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&upstream).with_context(|| format!("read {upstream}"))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let path = Utf8PathBuf::from_path_buf(entry.path())
+                .map_err(|p| anyhow::anyhow!("non-utf8 path: {}", p.display()))?;
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    Ok(candidates.into_iter().next())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,15 +131,27 @@ mod tests {
     }
 
     #[test]
-    fn explicit_vendored_target_wins() {
-        let plan = resolve_init_plan(&InitArgs {
-            source_repo: None,
-            source: Some("spades-rs/reference/upstream/SPAdes-4.2.0".into()),
-            target: Some("spades-rs".into()),
-            apply: false,
-            dry_run: true,
-        })
-        .unwrap();
-        assert_eq!(plan.target_repo, Utf8PathBuf::from("spades-rs"));
+    fn plain_source_uses_sibling_target() {
+        let plan = resolve_repo_plan(Utf8Path::new("/tmp/bowtie2")).unwrap();
+        assert_eq!(plan.source_repo, Utf8PathBuf::from("/tmp/bowtie2"));
+        assert_eq!(plan.target_repo, Utf8PathBuf::from("/tmp/bowtie2-rs"));
+        assert_eq!(plan.layout, PortLayout::SeparateSourceTarget);
+    }
+
+    #[test]
+    fn vendored_target_is_detected_from_single_repo_arg() {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("c2rust-port-init-test-{}", std::process::id()));
+        let source = root.join("reference/upstream/SPAdes-4.2.0");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"spades-rs\"\n").unwrap();
+
+        let plan = resolve_repo_plan(&root).unwrap();
+        assert_eq!(plan.source_repo, source);
+        assert_eq!(plan.target_repo, root);
+        assert_eq!(plan.layout, PortLayout::VendoredSource);
+
+        let _ = std::fs::remove_dir_all(plan.target_repo);
     }
 }

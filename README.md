@@ -1,40 +1,66 @@
 # c2rust_port
 
-`c2rust_port` maps C/C++ repositories and prepares bounded Rust porting work. V1 is a planner and evidence collector, not an autonomous editor.
+`c2rust_port` maps one C/C++ porting repo, captures tracing evidence, prepares benchmark manifests, and writes bounded Rust porting packets. V1 is a deterministic planner and evidence collector, not an autonomous editor.
 
 Binary name: `c2rust-port`.
 
-## Workflow
+## Command
 
 ```bash
-c2rust-port init /path/to/source-c-repo
-c2rust-port inspect /path/to/source-c-repo
-c2rust-port bench prepare /path/to/source-c-repo
-c2rust-port bench run-source /path/to/source-c-repo
-c2rust-port packets /path/to/source-c-repo /path/to/source-name-rs
+c2rust-port /path/to/repo
 ```
 
-`init` is dry by default. Pass `--apply` to create the target scaffold.
+There are no optional CLI arguments.
 
-## Examples
+## How It Works
 
-Separate source and target, Bowtie-style:
+The input repo is interpreted in one of two layouts:
 
-```bash
-c2rust-port init /repos/bowtie2 --apply
-c2rust-port inspect /repos/bowtie2
-c2rust-port packets /repos/bowtie2 /repos/bowtie2-rs
-```
+- C/C++ source repo: `/repos/bowtie2` maps as source `/repos/bowtie2` and target `/repos/bowtie2-rs`.
+- Rust repo with vendored source: `/repos/spades-rs` maps as target `/repos/spades-rs` and source `/repos/spades-rs/reference/upstream/<first-source-dir>`.
 
-Vendored source, SPAdes-style:
+Each run does the same phases:
 
-```bash
-c2rust-port init --source spades-rs/reference/upstream/SPAdes-4.2.0 --target spades-rs --dry-run
-```
+1. Resolve source and target paths.
+2. Create the target scaffold if it is missing.
+3. Inspect the source repo.
+4. Prepare tiny, smoke, medium, and large benchmark manifests.
+5. Run source-build probe evidence.
+6. Generate bounded translator packets in the target repo.
 
-## Tools
+## Outputs
 
-Required for useful inspection: `clang`, `clang++`, `clang-tidy`, `clang-query`, `clangd`, `bear`, `ctags`, `cflow`, `joern`, `codeql`, `perf`, `valgrind`, `gprof`, `gcov`, `rr`, `cargo`, `cargo flamegraph`, `cargo-llvm-cov`, and `seqtk`.
+Source repo outputs:
+
+- `.c2rust-port/inspect/tool-audit.json`
+- `.c2rust-port/inspect/build-system.json`
+- `.c2rust-port/inspect/source-inventory.json`
+- `.c2rust-port/inspect/entrypoints.json`
+- `.c2rust-port/inspect/diagnostic-runs.jsonl`
+- `.c2rust-port/bench/manifests/*.json`
+- `.c2rust-port/bench/runs/*.jsonl`
+
+Target repo outputs:
+
+- `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `README.md`, `PORTING.md`, `GOAL.md` when missing
+- `.c-to-rust-port/STATUS.md`
+- `.c-to-rust-port/agents/*.md`
+- `.c-to-rust-port/units/*/TASK.md`
+- `.c-to-rust-port/prompt_profiles/*.toml`
+- `.c-to-rust-port/packet_outcomes.jsonl`
+
+## Tool Audit
+
+The audit records `name`, `category`, `purpose`, `installed`, and `path`. Useful tools are grouped across both sides of the port:
+
+- Repo mapping: `repo-system-map`
+- C/C++ mapping: `clang`, `clang++`, `clang-tidy`, `clang-query`, `clangd`, `ctags`, `cflow`, `cscope`, `doxygen`, `joern`, `codeql`
+- C/C++ build capture: `bear`, `intercept-build`, `compiledb`, `cmake`, `make`, `ninja`, `meson`, `pkg-config`
+- C/C++ tracing: `llvm-cov`, `llvm-profdata`, `gprof`, `gcov`, `lcov`
+- Runtime tracing: `strace`, `ltrace`, `perf`, `valgrind`, `callgrind_annotate`, `rr`, `gdb`, `lldb`, `bpftrace`, `hyperfine`, `time`, `heaptrack`
+- Rust mapping: `cargo`, `rustc`, `rustdoc`, `rustfmt`, `clippy-driver`, `rust-analyzer`, `cargo-metadata`, `cargo-expand`, `cargo-modules`, `cargo-udeps`, `cargo-deny`
+- Rust tracing: `cargo-nextest`, `cargo-llvm-cov`, `cargo-flamegraph`, `cargo-profiler`, `cargo-bloat`, `cargo-asm`, `cargo-instruments`
+- Benchmark corpus: `seqtk`, `samtools`
 
 On Arch, install missing `seqtk` with:
 
@@ -42,7 +68,9 @@ On Arch, install missing `seqtk` with:
 yay -S seqtk
 ```
 
-`inspect` attempts:
+## Mapping Commands
+
+The inspection phase attempts:
 
 ```bash
 repo-system-map rewrite-prep <source> --source auto --target rust
@@ -53,7 +81,7 @@ Failures are recorded as diagnostics instead of stopping the whole run.
 
 ## Local Config
 
-Public defaults do not include machine-local paths. Put local paths in ignored `.c2rust-port.local.toml`:
+Public defaults do not include machine-local paths. Put local paths in ignored `.c2rust-port.local.toml` if future versions need them:
 
 ```toml
 benchmark_root = "/path/to/port-bench-data"
@@ -61,20 +89,6 @@ biological_data_root = "/path/to/biological data"
 repo_system_map = "repo-system-map"
 ```
 
-## Outputs
-
-Inspection writes:
-
-- `.c2rust-port/inspect/tool-audit.json`
-- `.c2rust-port/inspect/build-system.json`
-- `.c2rust-port/inspect/source-inventory.json`
-- `.c2rust-port/inspect/entrypoints.json`
-- `.c2rust-port/inspect/diagnostic-runs.jsonl`
-
-Benchmark preparation writes tiny, smoke, medium, and large manifests. `full` is intentionally manual.
-
-Packets write `.c-to-rust-port/units/*/TASK.md`, `.c-to-rust-port/prompt_profiles/*.toml`, and `.c-to-rust-port/packet_outcomes.jsonl`.
-
 ## Safety Model
 
-Mapper commands may run diagnostics and instrumentation. Translator packets are draft-only and forbid git, Cargo, builds, benchmarks, package managers, broad scans, shared-worktree edits, and mutation. Apply/converge packets are the only phase allowed to edit and verify.
+Mapper phases may run diagnostics and instrumentation. Translator packets are draft-only and forbid git, Cargo, builds, benchmarks, package managers, broad scans, shared-worktree edits, and mutation. Apply/converge packets are the only phase allowed to edit and verify.
