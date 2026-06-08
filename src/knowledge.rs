@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
+use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,6 +65,18 @@ struct EvidenceRun {
     timestamp: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CapabilityRecord {
+    name: String,
+    category: String,
+    purpose: String,
+    status: String,
+    path: Option<String>,
+    evidence_runs: Vec<String>,
+    blockers: Vec<String>,
+    agent_use: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SourceRepoMap {
     source_repo: Utf8PathBuf,
@@ -109,6 +124,53 @@ struct RustModulePlan {
     reason: String,
 }
 
+#[derive(Debug, Default, Clone)]
+struct DoxygenFacts {
+    symbols: Vec<serde_json::Value>,
+    types: Vec<serde_json::Value>,
+    call_edges: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Default)]
+struct DoxygenCompound {
+    id: String,
+    kind: String,
+    name: String,
+    file: Option<String>,
+    line: Option<u64>,
+    brief: String,
+    detail: String,
+}
+
+#[derive(Debug, Default)]
+struct DoxygenMember {
+    id: String,
+    kind: String,
+    name: String,
+    type_text: String,
+    definition: String,
+    args_string: String,
+    file: Option<String>,
+    line: Option<u64>,
+    brief: String,
+    detail: String,
+    references: Vec<DoxygenReference>,
+}
+
+#[derive(Debug, Default)]
+struct DoxygenReference {
+    refid: Option<String>,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct RustFunction {
+    name: String,
+    path: Utf8PathBuf,
+    line: u64,
+    signature: String,
+}
+
 const MAX_REPO_MAP_CALL_EDGES: usize = 100_000;
 const MAX_NORMALIZED_CFLOW_EDGES: usize = 250_000;
 
@@ -150,11 +212,14 @@ pub fn run(source: &Utf8Path, target: &Utf8Path) -> Result<()> {
     write_skeleton_files(&out)?;
     let evidence_runs = collect_raw_evidence(source, target, &out, &strategy)?;
     write_jsonl(&out.join("raw/evidence-runs.jsonl"), &evidence_runs)?;
+    write_capability_matrix(&out, &strategy, &evidence_runs)?;
     let repo_map = build_repo_map(source, target)?;
-    normalize_facts(source, target, &out, &repo_map, &evidence_runs)?;
+    normalize_facts(source, target, &out, &strategy, &repo_map, &evidence_runs)?;
     write_json(&out.join("repo-map.json"), &repo_map)?;
     write_repo_map_markdown(&out.join("repo-map.md"), &repo_map)?;
     write_mirror_docs(target, &repo_map)?;
+    write_evidence_db(&out, &strategy)?;
+    write_evidence_queries(&out.join("EVIDENCE_QUERIES.md"))?;
     write_full_picture(
         &out.join("bundles/full-picture.md"),
         &strategy,
@@ -188,7 +253,6 @@ fn stages() -> Vec<KnowledgeStage> {
             "source-structure",
             "Map files, symbols, declarations, definitions, includes, and source-level ownership boundaries.",
             &[
-                "repo-system-map",
                 "clang-query (compile database only)",
                 "clangd",
                 "ctags",
@@ -290,9 +354,21 @@ fn stages() -> Vec<KnowledgeStage> {
 fn fact_tables() -> Vec<FactTable> {
     vec![
         fact(
+            "tool_runs",
+            "tool:timestamp",
+            &["all evidence runners"],
+            "Every command executed by the mapper, with status, raw output paths, hashes, and notes.",
+        ),
+        fact(
+            "capabilities",
+            "tool",
+            &["tool-audit", "evidence-runs"],
+            "Per-tool readiness matrix: missing, available but unused, ran successfully, or ran with blockers.",
+        ),
+        fact(
             "files",
             "path",
-            &["repo-system-map", "walkdir", "repomix"],
+            &["walkdir", "repomix"],
             "All source, header, generated, test, data, and target files with hashes and roles.",
         ),
         fact(
@@ -315,6 +391,12 @@ fn fact_tables() -> Vec<FactTable> {
             "Functions, types, constants, macros, methods, modules, and public APIs.",
         ),
         fact(
+            "types",
+            "language:path:name:line",
+            &["doxygen", "ctags", "clang-query", "rustdoc"],
+            "Classes, structs, unions, enums, typedefs, and their doc comments when available.",
+        ),
+        fact(
             "call_edges",
             "caller:callee:source_span",
             &[
@@ -326,6 +408,30 @@ fn fact_tables() -> Vec<FactTable> {
                 "callgrind_annotate",
             ],
             "Static and dynamic caller-callee evidence with provenance.",
+        ),
+        fact(
+            "dataflow_edges",
+            "from:to:evidence",
+            &["source-inventory", "repo-map", "cflow", "codeql", "joern"],
+            "Include, call, and other source-to-source dependency edges with evidence labels.",
+        ),
+        fact(
+            "feature_tags",
+            "entity:feature",
+            &["source-inventory", "repo-map"],
+            "Heuristic feature labels for narrowing agent queries to indexing, alignment, FM-index, and benchmark areas.",
+        ),
+        fact(
+            "equivalence_edges",
+            "cpp_entity:rust_entity",
+            &["rust-mirror-plan", "symbols", "rust-source-scan"],
+            "Initial source-to-Rust mirror edges plus function-name matches that agents can strengthen after parity evidence.",
+        ),
+        fact(
+            "equivalence_diffs",
+            "cpp_entity:rust_entity",
+            &["equivalence_edges", "symbols", "rust-source-scan"],
+            "Signature and mapping diff rows for cross-repo source-to-Rust matches.",
         ),
         fact(
             "diagnostics",
@@ -393,11 +499,9 @@ fn fact_tables() -> Vec<FactTable> {
 
 fn dedupe_rules() -> Vec<DedupeRule> {
     vec![
-        dedupe(
-            "files",
-            "path",
-            &["repo-system-map", "source-inventory", "repomix"],
-        ),
+        dedupe("tool_runs", "tool:timestamp", &["evidence-runs"]),
+        dedupe("capabilities", "tool", &["evidence-runs", "tool-audit"]),
+        dedupe("files", "path", &["source-inventory", "repomix"]),
         dedupe(
             "build_units",
             "command_hash",
@@ -416,6 +520,11 @@ fn dedupe_rules() -> Vec<DedupeRule> {
             ],
         ),
         dedupe(
+            "types",
+            "language:path:name:line",
+            &["doxygen", "ctags", "clang-query", "rustdoc"],
+        ),
+        dedupe(
             "call_edges",
             "caller:callee:source_span",
             &[
@@ -426,6 +535,22 @@ fn dedupe_rules() -> Vec<DedupeRule> {
                 "perf",
                 "callgrind_annotate",
             ],
+        ),
+        dedupe(
+            "dataflow_edges",
+            "from:to:evidence",
+            &["repo-map", "cflow", "codeql", "joern"],
+        ),
+        dedupe("feature_tags", "entity:feature", &["repo-map"]),
+        dedupe(
+            "equivalence_edges",
+            "cpp_entity:rust_entity",
+            &["function-name-match", "rust-mirror-plan"],
+        ),
+        dedupe(
+            "equivalence_diffs",
+            "cpp_entity:rust_entity",
+            &["function-name-match", "rust-mirror-plan"],
         ),
         dedupe(
             "diagnostics",
@@ -535,6 +660,8 @@ fn write_markdown(
     text.push_str("- Preserve raw outputs before summarizing.\n");
     text.push_str("- Normalize raw outputs into fact tables.\n");
     text.push_str("- Dedupe by stable keys while retaining provenance.\n");
+    text.push_str("- Write `capability-matrix.json` before agent work so missing or blocked tools are explicit.\n");
+    text.push_str("- Index normalized rows into `evidence.db` so agents can query facts instead of rediscovering structure.\n");
     text.push_str("- Generate `bundles/full-picture.md` as the agent-consumable map.\n");
     text.push_str("- Use repomix as a final bundling layer when installed, not as the only source of truth.\n\n");
     text.push_str("## Stages\n\n");
@@ -568,10 +695,17 @@ fn write_skeleton_files(out: &Utf8Path) -> Result<()> {
     }
 
     for name in [
+        "tool_runs",
+        "capabilities",
         "files",
         "build_units",
         "symbols",
+        "types",
         "call_edges",
+        "dataflow_edges",
+        "feature_tags",
+        "equivalence_edges",
+        "equivalence_diffs",
         "diagnostics",
         "semantic_graphs",
         "runtime_events",
@@ -768,6 +902,21 @@ fn collect_raw_evidence(
             "symbol and caller/callee cross-reference database",
         )?);
     }
+    if installed.contains("doxygen") && !source_files.is_empty() {
+        let doxygen_dir = out.join("raw/source-structure/doxygen");
+        std::fs::create_dir_all(&doxygen_dir).with_context(|| format!("create {doxygen_dir}"))?;
+        let doxyfile = doxygen_dir.join("Doxyfile");
+        write_doxygen_config(source, &doxygen_dir, &doxyfile)?;
+        let args = vec!["doxygen".to_string(), doxyfile.to_string()];
+        runs.push(run_capture_owned(
+            source,
+            out,
+            "source-structure",
+            "doxygen",
+            &args,
+            "Doxygen XML extraction for symbols, types, docs, and reference edges",
+        )?);
+    }
     if installed.contains("codeql") && source.join("Makefile").exists() {
         std::fs::create_dir_all(out.join("raw/semantic-analysis/codeql"))
             .with_context(|| format!("create {}", out.join("raw/semantic-analysis/codeql")))?;
@@ -917,6 +1066,125 @@ fn run_capture_owned(
     })
 }
 
+fn write_capability_matrix(
+    out: &Utf8Path,
+    strategy: &KnowledgeStrategy,
+    evidence_runs: &[EvidenceRun],
+) -> Result<()> {
+    let records = capability_records(strategy, evidence_runs);
+    write_json(&out.join("capability-matrix.json"), &records)?;
+
+    let mut text = String::new();
+    text.push_str("# Capability Matrix\n\n");
+    text.push_str("This is the source-truth matrix for agent tool use. `ran_ok` means the tool produced raw evidence in this run; `available_unrun` means it is callable but the repo shape did not need it yet; `ran_failed` records the blocker and raw output paths.\n\n");
+    text.push_str("| Tool | Category | Status | Agent Use | Evidence / Blocker |\n");
+    text.push_str("| --- | --- | --- | --- | --- |\n");
+    for record in &records {
+        let evidence = if record.blockers.is_empty() {
+            record.evidence_runs.join("<br>")
+        } else {
+            record.blockers.join("<br>")
+        };
+        text.push_str(&format!(
+            "| `{}` | {} | `{}` | {} | {} |\n",
+            record.name,
+            markdown_table_cell(&record.category),
+            record.status,
+            markdown_table_cell(&record.agent_use),
+            markdown_table_cell(&evidence),
+        ));
+    }
+    std::fs::write(out.join("capability-matrix.md"), text)
+        .with_context(|| format!("write {}", out.join("capability-matrix.md")))?;
+    Ok(())
+}
+
+fn capability_records(
+    strategy: &KnowledgeStrategy,
+    evidence_runs: &[EvidenceRun],
+) -> Vec<CapabilityRecord> {
+    strategy
+        .installed_tools
+        .iter()
+        .chain(strategy.missing_tools.iter())
+        .map(|tool| {
+            let related_runs = evidence_runs
+                .iter()
+                .filter(|run| tool_matches_run(&tool.name, &run.tool))
+                .collect::<Vec<_>>();
+            let evidence = related_runs
+                .iter()
+                .map(|run| {
+                    format!(
+                        "{}:{}:stdout={}:stderr={}",
+                        run.tool, run.status, run.stdout_path, run.stderr_path
+                    )
+                })
+                .collect::<Vec<_>>();
+            let blockers = if !tool.installed {
+                vec!["not found on PATH".to_string()]
+            } else {
+                related_runs
+                    .iter()
+                    .filter(|run| run.status != "ok")
+                    .map(|run| {
+                        format!(
+                            "{} failed{}; inspect {} and {}",
+                            run.tool,
+                            run.exit_code
+                                .map(|code| format!(" with exit {code}"))
+                                .unwrap_or_default(),
+                            run.stdout_path,
+                            run.stderr_path
+                        )
+                    })
+                    .collect()
+            };
+            let status = if !tool.installed {
+                "missing"
+            } else if related_runs.iter().any(|run| run.status != "ok") {
+                "ran_failed"
+            } else if related_runs.iter().any(|run| run.status == "ok") {
+                "ran_ok"
+            } else {
+                "available_unrun"
+            };
+            CapabilityRecord {
+                name: tool.name.clone(),
+                category: tool.category.clone(),
+                purpose: tool.purpose.clone(),
+                status: status.to_string(),
+                path: tool.path.clone(),
+                evidence_runs: evidence,
+                blockers,
+                agent_use: agent_use_for_capability(status, &tool.name),
+            }
+        })
+        .collect()
+}
+
+fn tool_matches_run(tool_name: &str, run_tool: &str) -> bool {
+    tool_name == run_tool
+        || (tool_name == "codeql" && run_tool.starts_with("codeql-"))
+        || (tool_name == "cargo" && run_tool.starts_with("cargo-"))
+}
+
+fn agent_use_for_capability(status: &str, tool_name: &str) -> String {
+    match status {
+        "ran_ok" => format!("Use `{tool_name}` raw outputs and normalized facts before guessing."),
+        "ran_failed" => format!("Read the `{tool_name}` blocker before retrying or relying on it."),
+        "available_unrun" => {
+            format!("Callable, but no evidence was collected this run; run only for targeted gaps.")
+        }
+        "missing" => "Do not plan around this tool until installed.".to_string(),
+        _ => "Unknown capability state; inspect raw evidence.".to_string(),
+    }
+}
+
+fn markdown_table_cell(input: &str) -> String {
+    input.replace('|', "\\|").replace('\n', "<br>")
+}
+
 fn build_repo_map(source: &Utf8Path, target: &Utf8Path) -> Result<SourceRepoMap> {
     let files = repo_files(source)?;
     let function_defs = infer_functions(source)?;
@@ -937,9 +1205,25 @@ fn normalize_facts(
     source: &Utf8Path,
     target: &Utf8Path,
     out: &Utf8Path,
+    strategy: &KnowledgeStrategy,
     repo_map: &SourceRepoMap,
     evidence_runs: &[EvidenceRun],
 ) -> Result<()> {
+    let doxygen_facts = normalize_doxygen_facts(out)?;
+    let symbols = normalize_symbols(out, repo_map, &doxygen_facts)?;
+    let types = normalize_types(&doxygen_facts);
+    let call_edges = normalize_call_edges(out, repo_map, &doxygen_facts)?;
+    let equivalence_edges = normalize_equivalence_edges(target, repo_map, &symbols)?;
+    let equivalence_diffs = normalize_equivalence_diffs(&equivalence_edges);
+
+    write_jsonl_values(
+        &out.join("facts/tool_runs.jsonl"),
+        &normalize_tool_runs(evidence_runs),
+    )?;
+    write_jsonl_values(
+        &out.join("facts/capabilities.jsonl"),
+        &normalize_capabilities(strategy, evidence_runs),
+    )?;
     write_jsonl_values(
         &out.join("facts/files.jsonl"),
         &normalize_file_facts(&repo_map.files),
@@ -948,13 +1232,24 @@ fn normalize_facts(
         &out.join("facts/build_units.jsonl"),
         &normalize_build_units(source, out, evidence_runs)?,
     )?;
+    write_jsonl_values(&out.join("facts/symbols.jsonl"), &symbols)?;
+    write_jsonl_values(&out.join("facts/types.jsonl"), &types)?;
+    write_jsonl_values(&out.join("facts/call_edges.jsonl"), &call_edges)?;
     write_jsonl_values(
-        &out.join("facts/symbols.jsonl"),
-        &normalize_symbols(out, repo_map)?,
+        &out.join("facts/dataflow_edges.jsonl"),
+        &normalize_dataflow_edges(repo_map),
     )?;
     write_jsonl_values(
-        &out.join("facts/call_edges.jsonl"),
-        &normalize_call_edges(out, repo_map)?,
+        &out.join("facts/feature_tags.jsonl"),
+        &normalize_feature_tags(repo_map),
+    )?;
+    write_jsonl_values(
+        &out.join("facts/equivalence_edges.jsonl"),
+        &equivalence_edges,
+    )?;
+    write_jsonl_values(
+        &out.join("facts/equivalence_diffs.jsonl"),
+        &equivalence_diffs,
     )?;
     write_jsonl_values(
         &out.join("facts/diagnostics.jsonl"),
@@ -989,6 +1284,54 @@ fn normalize_facts(
         &normalize_repo_map(repo_map),
     )?;
     Ok(())
+}
+
+fn normalize_tool_runs(evidence_runs: &[EvidenceRun]) -> Vec<serde_json::Value> {
+    evidence_runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({
+                "fact_type": "tool_run",
+                "key": format!("{}:{}", run.tool, run.timestamp.to_rfc3339()),
+                "stage": run.stage,
+                "tool": run.tool,
+                "command": run.command,
+                "status": run.status,
+                "exit_code": run.exit_code,
+                "stdout_path": run.stdout_path,
+                "stderr_path": run.stderr_path,
+                "stdout_sha256": run.stdout_sha256,
+                "stderr_sha256": run.stderr_sha256,
+                "notes": run.notes,
+                "timestamp": run.timestamp,
+                "provenance": [run.stdout_path, run.stderr_path],
+            })
+        })
+        .collect()
+}
+
+fn normalize_capabilities(
+    strategy: &KnowledgeStrategy,
+    evidence_runs: &[EvidenceRun],
+) -> Vec<serde_json::Value> {
+    capability_records(strategy, evidence_runs)
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "fact_type": "capability",
+                "key": record.name,
+                "name": record.name,
+                "category": record.category,
+                "purpose": record.purpose,
+                "status": record.status,
+                "path": record.path,
+                "evidence_runs": record.evidence_runs,
+                "blockers": record.blockers,
+                "agent_use": record.agent_use,
+                "provenance": ["tool-audit", "raw/evidence-runs.jsonl"],
+            })
+        })
+        .collect()
 }
 
 fn normalize_file_facts(files: &[RepoFile]) -> Vec<serde_json::Value> {
@@ -1038,7 +1381,408 @@ fn normalize_build_units(
     Ok(rows)
 }
 
-fn normalize_symbols(out: &Utf8Path, repo_map: &SourceRepoMap) -> Result<Vec<serde_json::Value>> {
+fn normalize_doxygen_facts(out: &Utf8Path) -> Result<DoxygenFacts> {
+    let mut facts = DoxygenFacts::default();
+    let xml_dir = out.join("raw/source-structure/doxygen/xml");
+    for path in find_paths(xml_dir, Some("xml"))? {
+        parse_doxygen_xml_file(&path, &mut facts)?;
+    }
+    facts.symbols = dedupe_rows_by_key_merge_provenance(facts.symbols);
+    facts.types = dedupe_rows_by_key_merge_provenance(facts.types);
+    facts.call_edges = dedupe_rows_by_key_merge_provenance(facts.call_edges);
+    Ok(facts)
+}
+
+fn parse_doxygen_xml_file(path: &Utf8Path, facts: &mut DoxygenFacts) -> Result<()> {
+    let xml = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    let mut reader = Reader::from_str(&xml);
+    reader.config_mut().trim_text(true);
+    let mut stack = Vec::<String>::new();
+    let mut compound: Option<DoxygenCompound> = None;
+    let mut member: Option<DoxygenMember> = None;
+    let mut reference: Option<DoxygenReference> = None;
+
+    loop {
+        match reader
+            .read_event()
+            .with_context(|| format!("parse {path}"))?
+        {
+            Event::Start(start) => {
+                let name = xml_event_name(&start);
+                match name.as_str() {
+                    "compounddef" => {
+                        compound = Some(DoxygenCompound {
+                            id: xml_attr(&start, b"id").unwrap_or_default(),
+                            kind: xml_attr(&start, b"kind").unwrap_or_default(),
+                            ..DoxygenCompound::default()
+                        });
+                    }
+                    "memberdef" => {
+                        member = Some(DoxygenMember {
+                            id: xml_attr(&start, b"id").unwrap_or_default(),
+                            kind: xml_attr(&start, b"kind").unwrap_or_default(),
+                            ..DoxygenMember::default()
+                        });
+                    }
+                    "references" => {
+                        reference = Some(DoxygenReference {
+                            refid: xml_attr(&start, b"refid")
+                                .or_else(|| xml_attr(&start, b"compoundref")),
+                            label: String::new(),
+                        });
+                    }
+                    "location" => {
+                        apply_doxygen_location(&start, &mut compound, &mut member);
+                    }
+                    _ => {}
+                }
+                stack.push(name);
+            }
+            Event::Empty(start) => {
+                let name = xml_event_name(&start);
+                match name.as_str() {
+                    "location" => apply_doxygen_location(&start, &mut compound, &mut member),
+                    "references" => {
+                        if let Some(member) = member.as_mut() {
+                            member.references.push(DoxygenReference {
+                                refid: xml_attr(&start, b"refid")
+                                    .or_else(|| xml_attr(&start, b"compoundref")),
+                                label: xml_attr(&start, b"name").unwrap_or_default(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Text(text) => {
+                if let Ok(text) = text.xml_content() {
+                    collect_doxygen_text(
+                        text.trim(),
+                        &stack,
+                        &mut compound,
+                        &mut member,
+                        &mut reference,
+                    );
+                }
+            }
+            Event::CData(text) => {
+                if let Ok(text) = text.xml_content() {
+                    collect_doxygen_text(
+                        text.trim(),
+                        &stack,
+                        &mut compound,
+                        &mut member,
+                        &mut reference,
+                    );
+                }
+            }
+            Event::End(end) => {
+                let name = String::from_utf8_lossy(end.name().as_ref()).to_string();
+                match name.as_str() {
+                    "references" => {
+                        if let (Some(member), Some(reference)) = (member.as_mut(), reference.take())
+                        {
+                            member.references.push(reference);
+                        }
+                    }
+                    "memberdef" => {
+                        if let Some(member) = member.take() {
+                            push_doxygen_member_facts(path, member, facts);
+                        }
+                    }
+                    "compounddef" => {
+                        if let Some(compound) = compound.take() {
+                            push_doxygen_compound_facts(path, compound, facts);
+                        }
+                    }
+                    _ => {}
+                }
+                let _ = stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn apply_doxygen_location(
+    start: &BytesStart<'_>,
+    compound: &mut Option<DoxygenCompound>,
+    member: &mut Option<DoxygenMember>,
+) {
+    let file = xml_attr(start, b"file");
+    let line = xml_attr(start, b"line").and_then(|line| line.parse::<u64>().ok());
+    if let Some(member) = member.as_mut() {
+        if file.is_some() {
+            member.file = file;
+        }
+        if line.is_some() {
+            member.line = line;
+        }
+    } else if let Some(compound) = compound.as_mut() {
+        if file.is_some() {
+            compound.file = file;
+        }
+        if line.is_some() {
+            compound.line = line;
+        }
+    }
+}
+
+fn collect_doxygen_text(
+    text: &str,
+    stack: &[String],
+    compound: &mut Option<DoxygenCompound>,
+    member: &mut Option<DoxygenMember>,
+    reference: &mut Option<DoxygenReference>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(reference) = reference.as_mut() {
+        append_doc_text(&mut reference.label, text);
+        return;
+    }
+    let current = stack.last().map(String::as_str).unwrap_or("");
+    if let Some(member) = member.as_mut() {
+        match current {
+            "name" if is_direct_xml_child(stack, "memberdef", "name") => {
+                append_inline_text(&mut member.name, text);
+            }
+            "type" if is_direct_xml_child(stack, "memberdef", "type") => {
+                append_inline_text(&mut member.type_text, text);
+            }
+            "definition" if is_direct_xml_child(stack, "memberdef", "definition") => {
+                append_inline_text(&mut member.definition, text);
+            }
+            "argsstring" if is_direct_xml_child(stack, "memberdef", "argsstring") => {
+                append_inline_text(&mut member.args_string, text);
+            }
+            _ if stack.iter().any(|tag| tag == "briefdescription") => {
+                append_doc_text(&mut member.brief, text);
+            }
+            _ if stack.iter().any(|tag| tag == "detaileddescription") => {
+                append_doc_text(&mut member.detail, text);
+            }
+            _ => {}
+        }
+    } else if let Some(compound) = compound.as_mut() {
+        match current {
+            "compoundname" if is_direct_xml_child(stack, "compounddef", "compoundname") => {
+                append_inline_text(&mut compound.name, text);
+            }
+            _ if stack.iter().any(|tag| tag == "briefdescription") => {
+                append_doc_text(&mut compound.brief, text);
+            }
+            _ if stack.iter().any(|tag| tag == "detaileddescription") => {
+                append_doc_text(&mut compound.detail, text);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_direct_xml_child(stack: &[String], parent: &str, child: &str) -> bool {
+    stack.last().is_some_and(|tag| tag == child)
+        && stack.iter().rev().nth(1).is_some_and(|tag| tag == parent)
+}
+
+fn push_doxygen_compound_facts(
+    xml_path: &Utf8Path,
+    compound: DoxygenCompound,
+    facts: &mut DoxygenFacts,
+) {
+    if !is_doxygen_type_kind(&compound.kind) || compound.name.trim().is_empty() {
+        return;
+    }
+    let key = format!(
+        "doxygen:type:{}:{}:{}",
+        compound.file.as_deref().unwrap_or("unknown"),
+        compound.name,
+        compound.line.unwrap_or(0)
+    );
+    let doc_comment = joined_doc(&compound.brief, &compound.detail);
+    facts.symbols.push(serde_json::json!({
+        "fact_type": "symbol",
+        "key": key,
+        "name": compound.name,
+        "qualified_name": compound.name,
+        "kind": compound.kind,
+        "path": compound.file,
+        "line": compound.line,
+        "signature": null,
+        "doc_comment": doc_comment,
+        "doxygen_id": compound.id,
+        "provenance": [xml_path.to_string()],
+    }));
+    facts.types.push(serde_json::json!({
+        "fact_type": "type",
+        "key": format!(
+            "doxygen:type:{}:{}:{}",
+            compound.file.as_deref().unwrap_or("unknown"),
+            compound.name,
+            compound.line.unwrap_or(0)
+        ),
+        "name": compound.name,
+        "qualified_name": compound.name,
+        "kind": compound.kind,
+        "path": compound.file,
+        "line": compound.line,
+        "doc_comment": doc_comment,
+        "doxygen_id": compound.id,
+        "fields": [],
+        "provenance": [xml_path.to_string()],
+    }));
+}
+
+fn push_doxygen_member_facts(xml_path: &Utf8Path, member: DoxygenMember, facts: &mut DoxygenFacts) {
+    if member.name.trim().is_empty() {
+        return;
+    }
+    let signature = doxygen_member_signature(&member);
+    let qualified_name = doxygen_qualified_name(&member);
+    let doc_comment = joined_doc(&member.brief, &member.detail);
+    facts.symbols.push(serde_json::json!({
+        "fact_type": "symbol",
+        "key": format!(
+            "doxygen:symbol:{}:{}:{}:{}",
+            member.file.as_deref().unwrap_or("unknown"),
+            member.name,
+            member.line.unwrap_or(0),
+            member.kind
+        ),
+        "name": member.name,
+        "qualified_name": qualified_name,
+        "kind": member.kind,
+        "path": member.file,
+        "line": member.line,
+        "signature": signature,
+        "return_type": empty_string_as_null(&member.type_text),
+        "doc_comment": doc_comment,
+        "doxygen_id": member.id,
+        "provenance": [xml_path.to_string()],
+    }));
+
+    if is_doxygen_type_kind(&member.kind) {
+        facts.types.push(serde_json::json!({
+            "fact_type": "type",
+            "key": format!(
+                "doxygen:type:{}:{}:{}",
+                member.file.as_deref().unwrap_or("unknown"),
+                member.name,
+                member.line.unwrap_or(0)
+            ),
+            "name": member.name,
+            "qualified_name": qualified_name,
+            "kind": member.kind,
+            "path": member.file,
+            "line": member.line,
+            "doc_comment": doc_comment,
+            "doxygen_id": member.id,
+            "fields": [],
+            "provenance": [xml_path.to_string()],
+        }));
+    }
+
+    if is_function_kind(Some(&member.kind)) {
+        for reference in member.references {
+            let callee = if reference.label.trim().is_empty() {
+                reference.refid.unwrap_or_else(|| "unknown".to_string())
+            } else {
+                reference.label
+            };
+            facts.call_edges.push(serde_json::json!({
+                "fact_type": "call_edge",
+                "key": format!("doxygen:{}->{}:{}", qualified_name, callee, member.line.unwrap_or(0)),
+                "caller": qualified_name,
+                "callee": callee,
+                "source_span": signature,
+                "evidence": "doxygen reference",
+                "provenance": [xml_path.to_string()],
+            }));
+        }
+    }
+}
+
+fn xml_event_name(start: &BytesStart<'_>) -> String {
+    String::from_utf8_lossy(start.name().as_ref()).to_string()
+}
+
+fn xml_attr(start: &BytesStart<'_>, key: &[u8]) -> Option<String> {
+    start
+        .attributes()
+        .with_checks(false)
+        .filter_map(Result::ok)
+        .find(|attr| attr.key.as_ref() == key)
+        .map(|attr| String::from_utf8_lossy(attr.value.as_ref()).to_string())
+}
+
+fn append_inline_text(target: &mut String, text: &str) {
+    if !target.is_empty() && !target.ends_with(' ') {
+        target.push(' ');
+    }
+    target.push_str(text);
+}
+
+fn append_doc_text(target: &mut String, text: &str) {
+    if !target.is_empty() && !target.ends_with(' ') {
+        target.push(' ');
+    }
+    target.push_str(text);
+}
+
+fn joined_doc(brief: &str, detail: &str) -> Option<String> {
+    let joined = [brief.trim(), detail.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn doxygen_member_signature(member: &DoxygenMember) -> Option<String> {
+    let mut signature = if member.definition.trim().is_empty() {
+        member.name.clone()
+    } else {
+        member.definition.clone()
+    };
+    if !member.args_string.trim().is_empty() {
+        signature.push_str(member.args_string.trim());
+    }
+    (!signature.trim().is_empty()).then_some(signature)
+}
+
+fn doxygen_qualified_name(member: &DoxygenMember) -> String {
+    if member.definition.trim().is_empty() {
+        member.name.clone()
+    } else {
+        member
+            .definition
+            .split_whitespace()
+            .last()
+            .unwrap_or(&member.name)
+            .to_string()
+    }
+}
+
+fn empty_string_as_null(input: &str) -> Option<String> {
+    let input = input.trim();
+    (!input.is_empty()).then_some(input.to_string())
+}
+
+fn is_doxygen_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class" | "struct" | "union" | "enum" | "typedef" | "interface"
+    )
+}
+
+fn normalize_symbols(
+    out: &Utf8Path,
+    repo_map: &SourceRepoMap,
+    doxygen_facts: &DoxygenFacts,
+) -> Result<Vec<serde_json::Value>> {
     let mut rows = Vec::new();
     for step in &repo_map.process_flow {
         rows.push(serde_json::json!({
@@ -1064,6 +1808,7 @@ fn normalize_symbols(out: &Utf8Path, repo_map: &SourceRepoMap) -> Result<Vec<ser
     if clang_query.exists() {
         rows.extend(parse_clang_query_symbols(&read_lines(&clang_query)?));
     }
+    rows.extend(doxygen_facts.symbols.iter().cloned());
     rows.sort_by_key(|row| {
         row.get("key")
             .and_then(|value| value.as_str())
@@ -1074,9 +1819,22 @@ fn normalize_symbols(out: &Utf8Path, repo_map: &SourceRepoMap) -> Result<Vec<ser
     Ok(rows)
 }
 
+fn normalize_types(doxygen_facts: &DoxygenFacts) -> Vec<serde_json::Value> {
+    let mut rows = doxygen_facts.types.clone();
+    rows.sort_by_key(|row| {
+        row.get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    rows.dedup_by(|left, right| left.get("key") == right.get("key"));
+    rows
+}
+
 fn normalize_call_edges(
     out: &Utf8Path,
     repo_map: &SourceRepoMap,
+    doxygen_facts: &DoxygenFacts,
 ) -> Result<Vec<serde_json::Value>> {
     let mut rows = Vec::new();
     for edge in repo_map
@@ -1101,6 +1859,7 @@ fn normalize_call_edges(
             MAX_NORMALIZED_CFLOW_EDGES,
         )?);
     }
+    rows.extend(doxygen_facts.call_edges.iter().cloned());
     rows.sort_by_key(|row| {
         row.get("key")
             .and_then(|value| value.as_str())
@@ -1111,6 +1870,160 @@ fn normalize_call_edges(
     Ok(rows)
 }
 
+fn normalize_dataflow_edges(repo_map: &SourceRepoMap) -> Vec<serde_json::Value> {
+    repo_map
+        .data_flow
+        .iter()
+        .map(|edge| {
+            serde_json::json!({
+                "fact_type": "dataflow_edge",
+                "key": format!("{}->{}:{}", edge.from, edge.to, edge.evidence),
+                "from": edge.from,
+                "to": edge.to,
+                "evidence": edge.evidence,
+                "provenance": ["repo_map"],
+            })
+        })
+        .collect()
+}
+
+fn normalize_feature_tags(repo_map: &SourceRepoMap) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for file in &repo_map.files {
+        for feature in feature_tags_for_text(file.path.as_str()) {
+            rows.push(serde_json::json!({
+                "fact_type": "feature_tag",
+                "key": format!("file:{}:{feature}", file.path),
+                "entity_kind": "file",
+                "entity": file.path,
+                "feature": feature,
+                "evidence": "path keyword heuristic",
+                "provenance": ["repo_map"],
+            }));
+        }
+    }
+    for step in &repo_map.process_flow {
+        let text = format!("{} {}", step.label, step.source);
+        for feature in feature_tags_for_text(&text) {
+            rows.push(serde_json::json!({
+                "fact_type": "feature_tag",
+                "key": format!("symbol:{}:{feature}", step.id),
+                "entity_kind": "symbol",
+                "entity": step.id,
+                "feature": feature,
+                "evidence": "symbol/path keyword heuristic",
+                "provenance": ["repo_map"],
+            }));
+        }
+    }
+    rows.sort_by_key(|row| {
+        row.get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    rows.dedup_by(|left, right| left.get("key") == right.get("key"));
+    rows
+}
+
+fn normalize_equivalence_edges(
+    target: &Utf8Path,
+    repo_map: &SourceRepoMap,
+    symbols: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for module in &repo_map.rust_mirror.modules {
+        for source_path in &module.mirrors {
+            rows.push(serde_json::json!({
+                "fact_type": "equivalence_edge",
+                "key": format!("{}=>{}", source_path, module.rust_path),
+                "cpp_entity": source_path,
+                "rust_entity": module.rust_path,
+                "confidence": "layout",
+                "diff_notes": "Initial mirror edge inferred from source ownership cluster; strengthen only after source-backed parity evidence.",
+                "provenance": ["rust_mirror_plan"],
+            }));
+        }
+    }
+    let rust_functions = infer_rust_functions(target)?;
+    let rust_by_name = rust_functions
+        .iter()
+        .map(|function| (canonical_symbol_name(&function.name), function))
+        .collect::<BTreeMap<_, _>>();
+    for symbol in symbols.iter().filter(|symbol| {
+        is_function_kind(row_string(symbol, "kind").as_deref())
+            && row_string(symbol, "path")
+                .as_deref()
+                .is_some_and(|path| language_for_path(path) != "rust")
+    }) {
+        let Some(source_name) =
+            row_string(symbol, "qualified_name").or_else(|| row_string(symbol, "name"))
+        else {
+            continue;
+        };
+        let canonical = canonical_symbol_name(&source_name);
+        let Some(rust_function) = rust_by_name.get(&canonical) else {
+            continue;
+        };
+        let source_path = row_string(symbol, "path").unwrap_or_else(|| "unknown".to_string());
+        rows.push(serde_json::json!({
+            "fact_type": "equivalence_edge",
+            "key": format!("function:{}=>{}", source_name, rust_function.path),
+            "cpp_entity": source_name,
+            "rust_entity": format!("{}:{}", rust_function.path, rust_function.name),
+            "confidence": "function-name",
+            "match_kind": "canonical_function_name",
+            "cpp_path": source_path,
+            "cpp_line": row_i64(symbol, "line"),
+            "cpp_signature": row_string(symbol, "signature"),
+            "rust_path": rust_function.path,
+            "rust_line": rust_function.line,
+            "rust_signature": rust_function.signature,
+            "diff_notes": "C/C++ and Rust functions share a canonical leaf name. This is a comparison target, not behavior parity evidence.",
+            "provenance": ["symbols", "rust-source-scan"],
+        }));
+    }
+    rows.sort_by_key(|row| {
+        row.get("key")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    rows.dedup_by(|left, right| left.get("key") == right.get("key"));
+    Ok(rows)
+}
+
+fn normalize_equivalence_diffs(equivalence_edges: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    equivalence_edges
+        .iter()
+        .filter(|row| row_string(row, "confidence").as_deref() == Some("function-name"))
+        .map(|row| {
+            let cpp_signature = row_string(row, "cpp_signature");
+            let rust_signature = row_string(row, "rust_signature");
+            let diff_status = match (cpp_signature.as_deref(), rust_signature.as_deref()) {
+                (Some(cpp), Some(rust)) if canonical_signature(cpp) == canonical_signature(rust) => {
+                    "signature_text_similar"
+                }
+                (Some(_), Some(_)) => "signature_text_differs",
+                (Some(_), None) => "missing_rust_signature",
+                (None, Some(_)) => "missing_cpp_signature",
+                (None, None) => "missing_signatures",
+            };
+            serde_json::json!({
+                "fact_type": "equivalence_diff",
+                "key": row_string(row, "key").unwrap_or_else(|| "unknown".to_string()),
+                "cpp_entity": row_string(row, "cpp_entity"),
+                "rust_entity": row_string(row, "rust_entity"),
+                "diff_status": diff_status,
+                "cpp_signature": cpp_signature,
+                "rust_signature": rust_signature,
+                "notes": "Function-name equivalence requires source-backed behavior validation before being treated as parity.",
+                "provenance": ["equivalence_edges"],
+            })
+        })
+        .collect()
+}
+
 fn normalize_diagnostics(
     _out: &Utf8Path,
     evidence_runs: &[EvidenceRun],
@@ -1119,7 +2032,12 @@ fn normalize_diagnostics(
     for run in evidence_runs.iter().filter(|run| {
         matches!(
             run.tool.as_str(),
-            "clang-tidy" | "cargo-check" | "codeql-create" | "codeql-analyze" | "joern-parse"
+            "clang-tidy"
+                | "cargo-check"
+                | "codeql-create"
+                | "codeql-analyze"
+                | "doxygen"
+                | "joern-parse"
         )
     }) {
         let mut lines = read_lines(&run.stdout_path)?;
@@ -1151,7 +2069,7 @@ fn normalize_semantic_graphs(
     for run in evidence_runs.iter().filter(|run| {
         matches!(
             run.tool.as_str(),
-            "clang-query" | "codeql-create" | "codeql-analyze" | "joern-parse"
+            "clang-query" | "codeql-create" | "codeql-analyze" | "doxygen" | "joern-parse"
         )
     }) {
         rows.push(serde_json::json!({
@@ -1199,6 +2117,19 @@ fn normalize_semantic_graphs(
             "key": format!("joern:cpg:{path}"),
             "tool": "joern-parse",
             "artifact_kind": "cpg",
+            "path": path,
+            "bytes": bytes.len(),
+            "sha256": sha256_hex(&bytes),
+            "provenance": [path.to_string()],
+        }));
+    }
+    for path in find_paths(out.join("raw/source-structure/doxygen/xml"), Some("xml"))? {
+        let bytes = std::fs::read(&path).with_context(|| format!("read {path}"))?;
+        rows.push(serde_json::json!({
+            "fact_type": "semantic_graph_artifact",
+            "key": format!("doxygen:xml:{path}"),
+            "tool": "doxygen",
+            "artifact_kind": "xml",
             "path": path,
             "bytes": bytes.len(),
             "sha256": sha256_hex(&bytes),
@@ -1471,6 +2402,61 @@ fn infer_functions(source: &Utf8Path) -> Result<BTreeMap<String, Utf8PathBuf>> {
     Ok(functions)
 }
 
+fn infer_rust_functions(target: &Utf8Path) -> Result<Vec<RustFunction>> {
+    let mut functions = Vec::new();
+    if !target.exists() {
+        return Ok(functions);
+    }
+    for entry in WalkDir::new(target).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = utf8_path(entry.path())?;
+        if path
+            .components()
+            .any(|component| matches!(component.as_str(), ".git" | ".c-to-rust-port" | "target"))
+        {
+            continue;
+        }
+        if path.extension() != Some("rs") {
+            continue;
+        }
+        let relative = path.strip_prefix(target).unwrap_or(&path).to_path_buf();
+        for (index, line) in read_lines(&path)?.into_iter().enumerate() {
+            let Some(name) = rust_function_name_from_line(&line) else {
+                continue;
+            };
+            functions.push(RustFunction {
+                name,
+                path: relative.clone(),
+                line: (index + 1) as u64,
+                signature: line.trim().to_string(),
+            });
+        }
+    }
+    functions.sort_by(|left, right| (&left.path, left.line).cmp(&(&right.path, right.line)));
+    Ok(functions)
+}
+
+fn rust_function_name_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") {
+        return None;
+    }
+    let fn_index = trimmed.find("fn ")?;
+    let before = &trimmed[..fn_index];
+    if !before.split_whitespace().all(|part| {
+        matches!(part, "pub" | "const" | "async" | "unsafe" | "extern") || part.starts_with("pub(")
+    }) {
+        return None;
+    }
+    let after = &trimmed[fn_index + 3..];
+    let name = after
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 fn infer_process_flow(functions: &BTreeMap<String, Utf8PathBuf>) -> Vec<ProcessStep> {
     let mut steps = Vec::new();
     if let Some(path) = functions.get("main") {
@@ -1699,6 +2685,11 @@ fn write_full_picture(
         count_jsonl_rows(&out.join("facts/semantic_graphs.jsonl"))?
     ));
     text.push_str(&format!(
+        "- Tool matrix: {} capability records and {} tool-run records indexed for agent queries.\n",
+        count_jsonl_rows(&out.join("facts/capabilities.jsonl"))?,
+        count_jsonl_rows(&out.join("facts/tool_runs.jsonl"))?
+    ));
+    text.push_str(&format!(
         "- Rust mirror: {} source ownership clusters.\n\n",
         repo_map.rust_mirror.modules.len()
     ));
@@ -1773,6 +2764,8 @@ fn write_full_picture(
     text.push_str("- Detailed mirror plan: target-side `.c-to-rust-port/RUST_MIRROR_PLAN.md`.\n\n");
 
     text.push_str("## Fact Tables\n\n");
+    text.push_str("All normalized rows are also indexed in `evidence.db` for SQLite queries. Use JSONL for raw citation text and SQLite for fast filtering.\n\n");
+    text.push_str("- Query recipes: `EVIDENCE_QUERIES.md`.\n");
     for table in &strategy.fact_tables {
         text.push_str(&format!(
             "- `facts/{}.jsonl`: {} rows. {}\n",
@@ -1782,12 +2775,555 @@ fn write_full_picture(
         ));
     }
     text.push_str("\n## Raw Evidence\n\n");
+    text.push_str("- SQLite evidence index: `evidence.db`.\n");
+    text.push_str("- SQLite query recipes: `EVIDENCE_QUERIES.md`.\n");
+    text.push_str(
+        "- Tool capability matrix: `capability-matrix.json` and `capability-matrix.md`.\n",
+    );
     text.push_str("- Tool run ledger: `raw/evidence-runs.jsonl`.\n");
     text.push_str("- Source structure: `raw/source-structure/`.\n");
     text.push_str("- Semantic analysis: `raw/semantic-analysis/`.\n");
     text.push_str("- Build capture: `raw/build-capture/`.\n");
     text.push_str("- Rust target: `raw/rust-target/`.\n");
     std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn write_evidence_db(out: &Utf8Path, strategy: &KnowledgeStrategy) -> Result<()> {
+    let db_path = out.join("evidence.db");
+    if db_path.exists() {
+        std::fs::remove_file(&db_path).with_context(|| format!("remove stale {db_path}"))?;
+    }
+    let mut conn =
+        Connection::open(db_path.as_std_path()).with_context(|| format!("open {db_path}"))?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = OFF;
+        CREATE TABLE facts (
+            table_name TEXT NOT NULL,
+            key TEXT NOT NULL,
+            fact_type TEXT,
+            json TEXT NOT NULL,
+            provenance_json TEXT NOT NULL,
+            PRIMARY KEY (table_name, key)
+        );
+        CREATE TABLE tool_runs (
+            key TEXT PRIMARY KEY,
+            stage TEXT,
+            tool TEXT,
+            command_json TEXT,
+            status TEXT,
+            exit_code INTEGER,
+            stdout_path TEXT,
+            stderr_path TEXT,
+            notes TEXT,
+            timestamp TEXT,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE capabilities (
+            name TEXT PRIMARY KEY,
+            category TEXT,
+            purpose TEXT,
+            status TEXT,
+            path TEXT,
+            evidence_runs_json TEXT,
+            blockers_json TEXT,
+            agent_use TEXT,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE files (
+            path TEXT PRIMARY KEY,
+            role TEXT,
+            bytes INTEGER,
+            sha256 TEXT,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE symbols (
+            key TEXT PRIMARY KEY,
+            name TEXT,
+            kind TEXT,
+            path TEXT,
+            line INTEGER,
+            signature TEXT,
+            provenance_json TEXT NOT NULL,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE functions (
+            key TEXT PRIMARY KEY,
+            language TEXT,
+            qualified_name TEXT,
+            signature TEXT,
+            return_type TEXT,
+            file TEXT,
+            line INTEGER,
+            doc_comment TEXT,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE types (
+            key TEXT PRIMARY KEY,
+            language TEXT,
+            qualified_name TEXT,
+            kind TEXT,
+            file TEXT,
+            line INTEGER,
+            fields_json TEXT,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE call_edges (
+            key TEXT PRIMARY KEY,
+            caller TEXT,
+            callee TEXT,
+            source_span TEXT,
+            evidence TEXT,
+            provenance_json TEXT NOT NULL,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE dataflow_edges (
+            key TEXT PRIMARY KEY,
+            source TEXT,
+            target TEXT,
+            evidence TEXT,
+            provenance_json TEXT NOT NULL,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE feature_tags (
+            key TEXT PRIMARY KEY,
+            entity_kind TEXT,
+            entity TEXT,
+            feature TEXT,
+            evidence TEXT,
+            provenance_json TEXT NOT NULL,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE equivalence_edges (
+            key TEXT PRIMARY KEY,
+            cpp_entity TEXT,
+            rust_entity TEXT,
+            confidence TEXT,
+            diff_notes TEXT,
+            provenance_json TEXT NOT NULL,
+            json TEXT NOT NULL
+        );
+        CREATE TABLE equivalence_diffs (
+            key TEXT PRIMARY KEY,
+            cpp_entity TEXT,
+            rust_entity TEXT,
+            diff_status TEXT,
+            cpp_signature TEXT,
+            rust_signature TEXT,
+            notes TEXT,
+            provenance_json TEXT NOT NULL,
+            json TEXT NOT NULL
+        );
+        CREATE INDEX idx_facts_table ON facts(table_name);
+        CREATE INDEX idx_symbols_name ON symbols(name);
+        CREATE INDEX idx_symbols_path ON symbols(path);
+        CREATE INDEX idx_types_name ON types(qualified_name);
+        CREATE INDEX idx_functions_name ON functions(qualified_name);
+        CREATE INDEX idx_call_edges_caller ON call_edges(caller);
+        CREATE INDEX idx_call_edges_callee ON call_edges(callee);
+        CREATE INDEX idx_dataflow_source ON dataflow_edges(source);
+        CREATE INDEX idx_dataflow_target ON dataflow_edges(target);
+        CREATE INDEX idx_feature_tags_feature ON feature_tags(feature);
+        ",
+    )
+    .with_context(|| format!("create schema in {db_path}"))?;
+
+    let tx = conn.transaction()?;
+    for table in &strategy.fact_tables {
+        let path = out.join(format!("facts/{}.jsonl", table.name));
+        for row in read_jsonl_values(&path)? {
+            insert_evidence_row(&tx, &table.name, &row)?;
+        }
+    }
+    tx.commit()
+        .with_context(|| format!("commit evidence db {db_path}"))?;
+    Ok(())
+}
+
+fn write_evidence_queries(path: &Utf8Path) -> Result<()> {
+    let mut text = String::new();
+    text.push_str("# Evidence DB Query Recipes\n\n");
+    text.push_str("Run from the source repo after `c2rust-port <repo>`:\n\n");
+    text.push_str("```bash\nsqlite3 .c2rust-port/knowledge/evidence.db\n```\n\n");
+    text.push_str("## Find Indexing Functions\n\n");
+    text.push_str("```sql\n");
+    text.push_str("SELECT f.qualified_name, f.file, f.line, f.signature\n");
+    text.push_str("FROM functions f\n");
+    text.push_str("LEFT JOIN feature_tags t ON t.entity = f.key OR t.entity = f.qualified_name OR t.entity = f.file\n");
+    text.push_str("WHERE t.feature = 'indexing'\n");
+    text.push_str("   OR lower(f.qualified_name) LIKE '%index%'\n");
+    text.push_str("   OR lower(f.qualified_name) LIKE '%bwt%'\n");
+    text.push_str("   OR lower(f.qualified_name) LIKE '%suffix%'\n");
+    text.push_str("ORDER BY f.file, f.line\nLIMIT 100;\n");
+    text.push_str("```\n\n");
+    text.push_str("## Show Callees For A Function\n\n");
+    text.push_str("```sql\n");
+    text.push_str("SELECT caller, callee, evidence, source_span\n");
+    text.push_str(
+        "FROM call_edges\nWHERE caller LIKE '%FUNCTION_OR_FILE%'\nORDER BY callee\nLIMIT 200;\n",
+    );
+    text.push_str("```\n\n");
+    text.push_str("## Show Data Flow Around Indexing Files\n\n");
+    text.push_str("```sql\n");
+    text.push_str("SELECT source, target, evidence\n");
+    text.push_str("FROM dataflow_edges\n");
+    text.push_str("WHERE lower(source) LIKE '%idx%' OR lower(target) LIKE '%idx%'\n");
+    text.push_str("   OR lower(source) LIKE '%bwt%' OR lower(target) LIKE '%bwt%'\n");
+    text.push_str("ORDER BY source, target\nLIMIT 200;\n");
+    text.push_str("```\n\n");
+    text.push_str("## List Failed Or Blocked Tools\n\n");
+    text.push_str("```sql\n");
+    text.push_str("SELECT name, status, blockers_json, agent_use\n");
+    text.push_str("FROM capabilities\nWHERE status IN ('ran_failed', 'missing')\nORDER BY name;\n");
+    text.push_str("```\n\n");
+    text.push_str("## Compare Source And Rust Mirror Candidates\n\n");
+    text.push_str("```sql\n");
+    text.push_str("SELECT cpp_entity, rust_entity, confidence, diff_notes\n");
+    text.push_str("FROM equivalence_edges\nORDER BY confidence DESC, cpp_entity\nLIMIT 200;\n");
+    text.push_str("```\n\n");
+    text.push_str("## Show Function-Level Diff Rows\n\n");
+    text.push_str("```sql\n");
+    text.push_str(
+        "SELECT cpp_entity, rust_entity, diff_status, cpp_signature, rust_signature, notes\n",
+    );
+    text.push_str("FROM equivalence_diffs\nORDER BY diff_status, cpp_entity\nLIMIT 200;\n");
+    text.push_str("```\n\n");
+    text.push_str("## Pull Raw JSON For A Citation\n\n");
+    text.push_str("```sql\n");
+    text.push_str(
+        "SELECT json FROM facts WHERE table_name = 'symbols' AND key = 'PASTE_FACT_KEY';\n",
+    );
+    text.push_str("```\n");
+    std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn insert_evidence_row(
+    tx: &rusqlite::Transaction<'_>,
+    table_name: &str,
+    row: &serde_json::Value,
+) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    let key = row_string(row, "key").unwrap_or_else(|| sha256_hex(json.as_bytes()));
+    let fact_type = row_string(row, "fact_type");
+    let provenance = row_json_text(row, "provenance")?;
+    tx.execute(
+        "INSERT OR REPLACE INTO facts(table_name, key, fact_type, json, provenance_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![table_name, key, fact_type, json, provenance],
+    )?;
+
+    match table_name {
+        "tool_runs" => insert_tool_run_row(tx, row),
+        "capabilities" => insert_capability_row(tx, row),
+        "files" => insert_file_row(tx, row),
+        "symbols" => insert_symbol_row(tx, row),
+        "types" => insert_type_row(tx, row),
+        "call_edges" => insert_call_edge_row(tx, row),
+        "dataflow_edges" => insert_dataflow_edge_row(tx, row),
+        "feature_tags" => insert_feature_tag_row(tx, row),
+        "equivalence_edges" => insert_equivalence_edge_row(tx, row),
+        "equivalence_diffs" => insert_equivalence_diff_row(tx, row),
+        _ => Ok(()),
+    }
+}
+
+fn insert_tool_run_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO tool_runs(
+            key, stage, tool, command_json, status, exit_code, stdout_path, stderr_path, notes,
+            timestamp, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            row_string(row, "key"),
+            row_string(row, "stage"),
+            row_string(row, "tool"),
+            row_json_text(row, "command")?,
+            row_string(row, "status"),
+            row_i64(row, "exit_code"),
+            row_string(row, "stdout_path"),
+            row_string(row, "stderr_path"),
+            row_string(row, "notes"),
+            row_string(row, "timestamp"),
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_capability_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO capabilities(
+            name, category, purpose, status, path, evidence_runs_json, blockers_json, agent_use, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            row_string(row, "name"),
+            row_string(row, "category"),
+            row_string(row, "purpose"),
+            row_string(row, "status"),
+            row_string(row, "path"),
+            row_json_text(row, "evidence_runs")?,
+            row_json_text(row, "blockers")?,
+            row_string(row, "agent_use"),
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_file_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO files(path, role, bytes, sha256, json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            row_string(row, "path"),
+            row_string(row, "role"),
+            row_i64(row, "bytes"),
+            row_string(row, "sha256"),
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_symbol_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    let key = row_string(row, "key");
+    let name = row_string(row, "name");
+    let kind = row_string(row, "kind");
+    let path = row_string(row, "path");
+    let line = row_i64(row, "line");
+    let signature = row_string(row, "signature");
+    let provenance = row_json_text(row, "provenance")?;
+    tx.execute(
+        "INSERT OR REPLACE INTO symbols(
+            key, name, kind, path, line, signature, provenance_json, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![key, name, kind, path, line, signature, provenance, json,],
+    )?;
+
+    if is_function_kind(kind.as_deref()) {
+        tx.execute(
+            "INSERT OR REPLACE INTO functions(
+                key, language, qualified_name, signature, return_type, file, line, doc_comment, json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                row_string(row, "key"),
+                path.as_deref().map(language_for_path),
+                row_string(row, "qualified_name").or(name.clone()),
+                signature,
+                row_string(row, "return_type"),
+                path,
+                line,
+                row_string(row, "doc_comment"),
+                json,
+            ],
+        )?;
+    } else if is_type_kind(kind.as_deref()) {
+        tx.execute(
+            "INSERT OR REPLACE INTO types(
+                key, language, qualified_name, kind, file, line, fields_json, json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                row_string(row, "key"),
+                path.as_deref().map(language_for_path),
+                name,
+                kind,
+                path,
+                line,
+                row_json_text(row, "fields")?,
+                json,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_type_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    let path = row_string(row, "path");
+    tx.execute(
+        "INSERT OR REPLACE INTO types(
+            key, language, qualified_name, kind, file, line, fields_json, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row_string(row, "key"),
+            path.as_deref().map(language_for_path),
+            row_string(row, "qualified_name").or_else(|| row_string(row, "name")),
+            row_string(row, "kind"),
+            path,
+            row_i64(row, "line"),
+            row_json_text(row, "fields")?,
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_call_edge_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO call_edges(
+            key, caller, callee, source_span, evidence, provenance_json, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row_string(row, "key"),
+            row_string(row, "caller"),
+            row_string(row, "callee"),
+            row_string(row, "source_span"),
+            row_string(row, "evidence"),
+            row_json_text(row, "provenance")?,
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_dataflow_edge_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO dataflow_edges(
+            key, source, target, evidence, provenance_json, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            row_string(row, "key"),
+            row_string(row, "from"),
+            row_string(row, "to"),
+            row_string(row, "evidence"),
+            row_json_text(row, "provenance")?,
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_feature_tag_row(tx: &rusqlite::Transaction<'_>, row: &serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO feature_tags(
+            key, entity_kind, entity, feature, evidence, provenance_json, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row_string(row, "key"),
+            row_string(row, "entity_kind"),
+            row_string(row, "entity"),
+            row_string(row, "feature"),
+            row_string(row, "evidence"),
+            row_json_text(row, "provenance")?,
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_equivalence_edge_row(
+    tx: &rusqlite::Transaction<'_>,
+    row: &serde_json::Value,
+) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO equivalence_edges(
+            key, cpp_entity, rust_entity, confidence, diff_notes, provenance_json, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row_string(row, "key"),
+            row_string(row, "cpp_entity"),
+            row_string(row, "rust_entity"),
+            row_string(row, "confidence"),
+            row_string(row, "diff_notes"),
+            row_json_text(row, "provenance")?,
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_equivalence_diff_row(
+    tx: &rusqlite::Transaction<'_>,
+    row: &serde_json::Value,
+) -> Result<()> {
+    let json = serde_json::to_string(row)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO equivalence_diffs(
+            key, cpp_entity, rust_entity, diff_status, cpp_signature, rust_signature, notes,
+            provenance_json, json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            row_string(row, "key"),
+            row_string(row, "cpp_entity"),
+            row_string(row, "rust_entity"),
+            row_string(row, "diff_status"),
+            row_string(row, "cpp_signature"),
+            row_string(row, "rust_signature"),
+            row_string(row, "notes"),
+            row_json_text(row, "provenance")?,
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn read_jsonl_values(path: &Utf8Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for (line_index, line) in read_lines(path)?.into_iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(
+            serde_json::from_str(&line)
+                .with_context(|| format!("parse {path} line {}", line_index + 1))?,
+        );
+    }
+    Ok(rows)
+}
+
+fn row_string(row: &serde_json::Value, key: &str) -> Option<String> {
+    row.get(key).and_then(|value| match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn row_i64(row: &serde_json::Value, key: &str) -> Option<i64> {
+    row.get(key).and_then(|value| value.as_i64())
+}
+
+fn row_json_text(row: &serde_json::Value, key: &str) -> Result<String> {
+    serde_json::to_string(row.get(key).unwrap_or(&serde_json::Value::Null))
+        .with_context(|| format!("serialize json field {key}"))
+}
+
+fn is_function_kind(kind: Option<&str>) -> bool {
+    kind.is_some_and(|kind| {
+        let lower = kind.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "function" | "entrypoint" | "method" | "prototype"
+        ) || lower.contains("function")
+    })
+}
+
+fn is_type_kind(kind: Option<&str>) -> bool {
+    kind.is_some_and(|kind| {
+        matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "class" | "struct" | "union" | "enum" | "typedef" | "interface"
+        )
+    })
+}
+
+fn language_for_path(path: &str) -> &'static str {
+    match Utf8Path::new(path).extension() {
+        Some("rs") => "rust",
+        Some("c" | "h") => "c",
+        Some("cc" | "cpp" | "cxx" | "C" | "hh" | "hpp" | "hxx") => "cpp",
+        _ => "unknown",
+    }
 }
 
 fn count_jsonl_rows(path: &Utf8Path) -> Result<usize> {
@@ -1812,6 +3348,67 @@ fn data_flow_counts(edges: &[DataFlowEdge]) -> BTreeMap<String, usize> {
         *counts.entry(edge.evidence.clone()).or_insert(0) += 1;
     }
     counts
+}
+
+fn feature_tags_for_text(text: &str) -> Vec<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    let mut tags = Vec::new();
+    if [
+        "index",
+        "idx",
+        "bwt",
+        "ebwt",
+        "fm",
+        "suffix",
+        "sais",
+        "blockwise",
+        "build",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        tags.push("indexing");
+    }
+    if ["align", "seed", "score", "extend", "sam", "read", "pair"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        tags.push("alignment");
+    }
+    if ["bwt", "ebwt", "fm_index", "fm-index", "fmindex"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        tags.push("fm_index");
+    }
+    if ["test", "bench", "example", "fixture", "lambda"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        tags.push("validation");
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn canonical_symbol_name(name: &str) -> String {
+    name.rsplit("::")
+        .next()
+        .unwrap_or(name)
+        .trim_start_matches('~')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn canonical_signature(signature: &str) -> String {
+    signature
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn source_files(source: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
@@ -1844,6 +3441,38 @@ fn write_cscope_file_list(path: &Utf8Path, source_files: &[Utf8PathBuf]) -> Resu
         text.push_str(source_file.as_str());
         text.push('\n');
     }
+    std::fs::write(path, text).with_context(|| format!("write {path}"))
+}
+
+fn write_doxygen_config(source: &Utf8Path, output_dir: &Utf8Path, path: &Utf8Path) -> Result<()> {
+    let text = format!(
+        r#"PROJECT_NAME = "c2rust-port-source-map"
+OUTPUT_DIRECTORY = "{output_dir}"
+INPUT = "{source}"
+RECURSIVE = YES
+EXTRACT_ALL = YES
+EXTRACT_STATIC = YES
+EXTRACT_LOCAL_CLASSES = YES
+EXTRACT_PRIVATE = YES
+FULL_PATH_NAMES = YES
+STRIP_FROM_PATH = "{source}"
+FILE_PATTERNS = *.c *.cc *.cpp *.cxx *.C *.h *.hh *.hpp *.hxx
+EXCLUDE_PATTERNS = */.git/* */.c2rust-port/* */target/*
+GENERATE_HTML = NO
+GENERATE_LATEX = NO
+GENERATE_XML = YES
+XML_OUTPUT = xml
+XML_PROGRAMLISTING = NO
+HAVE_DOT = YES
+CALL_GRAPH = YES
+CALLER_GRAPH = YES
+REFERENCES_RELATION = YES
+REFERENCED_BY_RELATION = YES
+QUIET = YES
+WARN_IF_UNDOCUMENTED = NO
+WARN_LOGFILE = "{output_dir}/warnings.log"
+"#
+    );
     std::fs::write(path, text).with_context(|| format!("write {path}"))
 }
 
@@ -2552,8 +4181,13 @@ mod tests {
     #[test]
     fn strategy_has_exhaustive_consolidation_tables() {
         let tables = fact_tables();
+        assert!(tables.iter().any(|table| table.name == "capabilities"));
         assert!(tables.iter().any(|table| table.name == "symbols"));
+        assert!(tables.iter().any(|table| table.name == "types"));
         assert!(tables.iter().any(|table| table.name == "call_edges"));
+        assert!(tables.iter().any(|table| table.name == "dataflow_edges"));
+        assert!(tables.iter().any(|table| table.name == "equivalence_edges"));
+        assert!(tables.iter().any(|table| table.name == "equivalence_diffs"));
         assert!(tables.iter().any(|table| table.name == "runtime_events"));
         assert!(tables.iter().any(|table| table.name == "rust_workspace"));
     }
@@ -2564,5 +4198,53 @@ mod tests {
         assert!(stages
             .iter()
             .any(|stage| stage.name == "bundle" && stage.tools.contains(&"repomix".to_string())));
+    }
+
+    #[test]
+    fn doxygen_xml_normalizer_extracts_docs_types_and_references() {
+        let dir = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("c2rust-port-doxygen-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml_path = dir.join("classExample.xml");
+        std::fs::write(
+            &xml_path,
+            r#"<doxygen>
+  <compounddef id="classExample" kind="class">
+    <compoundname>Example</compoundname>
+    <briefdescription><para>Class docs.</para></briefdescription>
+    <sectiondef>
+      <memberdef id="classExample_1a" kind="function">
+        <type>int</type>
+        <definition>int Example::lookup</definition>
+        <argsstring>(int key)</argsstring>
+        <name>lookup</name>
+        <briefdescription><para>Lookup docs.</para></briefdescription>
+        <location file="src/index.cpp" line="42"/>
+        <references refid="classExample_1b">probe</references>
+      </memberdef>
+    </sectiondef>
+  </compounddef>
+</doxygen>"#,
+        )
+        .unwrap();
+        let mut facts = DoxygenFacts::default();
+        parse_doxygen_xml_file(&xml_path, &mut facts).unwrap();
+        assert!(facts.symbols.iter().any(|row| {
+            row.get("name").and_then(|value| value.as_str()) == Some("lookup")
+                && row
+                    .get("doc_comment")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|text| text.contains("Lookup docs"))
+        }));
+        assert!(facts.types.iter().any(|row| {
+            row.get("qualified_name").and_then(|value| value.as_str()) == Some("Example")
+        }));
+        assert!(facts.call_edges.iter().any(|row| {
+            row.get("caller").and_then(|value| value.as_str()) == Some("Example::lookup")
+                && row.get("callee").and_then(|value| value.as_str()) == Some("probe")
+        }));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -8,11 +8,6 @@ use walkdir::WalkDir;
 
 const TOOLS: &[ToolSpec] = &[
     ToolSpec::new(
-        "repo-system-map",
-        "repo mapping",
-        "cross-language repository maps and packet rows",
-    ),
-    ToolSpec::new(
         "repomix",
         "repo bundling",
         "final source and fact bundle for agent context",
@@ -279,13 +274,7 @@ pub fn run(source: &Utf8Path) -> Result<()> {
     let inventory = source_inventory(source)?;
     write_json(&out.join("source-inventory.json"), &inventory)?;
     write_json(&out.join("entrypoints.json"), &entrypoints(&inventory))?;
-    write_jsonl(
-        &out.join("diagnostic-runs.jsonl"),
-        &[
-            repo_system_map_run("rewrite-prep", source),
-            repo_system_map_run("semantic-export", source),
-        ],
-    )?;
+    write_jsonl(&out.join("diagnostic-runs.jsonl"), &[] as &[DiagnosticRun])?;
     println!("wrote inspection artifacts to {out}");
     Ok(())
 }
@@ -381,48 +370,6 @@ fn is_source_file(path: &Utf8Path) -> bool {
     )
 }
 
-fn repo_system_map_run(kind: &str, source: &Utf8Path) -> DiagnosticRun {
-    let args: &[&str] = match kind {
-        "rewrite-prep" => &[
-            "rewrite-prep",
-            source.as_str(),
-            "--source",
-            "auto",
-            "--target",
-            "rust",
-        ],
-        "semantic-export" => &[
-            "semantic-export",
-            source.as_str(),
-            "--tool",
-            "clang",
-            "--emit",
-            "all",
-        ],
-        _ => &[],
-    };
-    let output = Command::new("repo-system-map").args(args).output();
-    match output {
-        Ok(output) => DiagnosticRun {
-            timestamp: Utc::now(),
-            tool: format!("repo-system-map {kind}"),
-            status: if output.status.success() {
-                "ok"
-            } else {
-                "failed"
-            }
-            .to_string(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        },
-        Err(err) => DiagnosticRun {
-            timestamp: Utc::now(),
-            tool: format!("repo-system-map {kind}"),
-            status: "unsupported".to_string(),
-            detail: err.to_string(),
-        },
-    }
-}
-
 fn write_json<T: Serialize>(path: &Utf8Path, value: &T) -> Result<()> {
     std::fs::write(path, serde_json::to_string_pretty(value)?)
         .with_context(|| format!("write {path}"))
@@ -459,6 +406,5 @@ mod tests {
         assert!(statuses.iter().any(|s| s.category == "C/C++ tracing"));
         assert!(statuses.iter().any(|s| s.category == "Rust mapping"));
         assert!(statuses.iter().any(|s| s.category == "Rust tracing"));
-        assert!(statuses.iter().any(|s| s.name == "repo-system-map"));
     }
 }

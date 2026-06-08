@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 pub struct LocalConfig {
     pub benchmark_root: Option<Utf8PathBuf>,
     pub biological_data_root: Option<Utf8PathBuf>,
-    pub repo_system_map: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -15,11 +14,10 @@ pub struct PacketProfile {
     pub max_source_files: usize,
     pub max_map_rows: usize,
     pub max_prompt_bytes: usize,
-    pub max_completion_tokens: usize,
     pub allow_verification: bool,
     pub require_unified_diff: bool,
     pub require_review_before_apply: bool,
-    pub forbidden_commands: Vec<String>,
+    pub translator_forbidden_commands: Vec<String>,
 }
 
 impl Default for PacketProfile {
@@ -29,11 +27,10 @@ impl Default for PacketProfile {
             max_source_files: 3,
             max_map_rows: 80,
             max_prompt_bytes: 24_000,
-            max_completion_tokens: 1800,
             allow_verification: false,
             require_unified_diff: true,
             require_review_before_apply: true,
-            forbidden_commands: vec![
+            translator_forbidden_commands: vec![
                 "git".to_string(),
                 "cargo".to_string(),
                 "make".to_string(),

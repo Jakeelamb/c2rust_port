@@ -59,10 +59,6 @@ pub fn apply_init(plan: &InitPlan) -> Result<()> {
         "pub fn placeholder() {}\n",
     )?;
     write_new(
-        &plan.target_repo.join("src/main.rs"),
-        "fn main() {\n    println!(\"ported source placeholder\");\n}\n",
-    )?;
-    write_new(
         &plan.target_repo.join("README.md"),
         "# Rust Port\n\nGenerated scaffold for a C/C++ to Rust port.\n",
     )?;
@@ -153,5 +149,28 @@ mod tests {
         assert_eq!(plan.layout, PortLayout::VendoredSource);
 
         let _ = std::fs::remove_dir_all(plan.target_repo);
+    }
+
+    #[test]
+    fn init_scaffold_does_not_create_fake_binary_entrypoint() {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "c2rust-port-init-scaffold-test-{}",
+                std::process::id()
+            ));
+        let plan = InitPlan {
+            input_repo: root.join("source"),
+            source_repo: root.join("source"),
+            target_repo: root.join("target"),
+            layout: PortLayout::SeparateSourceTarget,
+        };
+
+        apply_init(&plan).unwrap();
+
+        assert!(plan.target_repo.join("src/lib.rs").exists());
+        assert!(!plan.target_repo.join("src/main.rs").exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

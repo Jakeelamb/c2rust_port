@@ -35,6 +35,18 @@ fn single_command_maps_makefile_repo_without_compile_commands() {
         "all:\n\tcc main.c math_ops.c -o main\n",
     )
     .unwrap();
+    let target = inferred_target(&root);
+    std::fs::create_dir_all(target.join("src")).unwrap();
+    std::fs::write(
+        target.join("Cargo.toml"),
+        "[package]\nname = \"fixture-rs\"\nedition = \"2024\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        target.join("src/lib.rs"),
+        "pub fn add(lhs: i32, rhs: i32) -> i32 {\n    lhs + rhs\n}\n",
+    )
+    .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_c2rust-port"))
         .arg(&root)
@@ -58,7 +70,26 @@ fn single_command_maps_makefile_repo_without_compile_commands() {
             .join(".c-to-rust-port/units/000-source-map/TASK.md")
             .exists()
     );
+    assert!(
+        inferred_target(&root)
+            .join(".c-to-rust-port/CITATION_VALIDATION.json")
+            .exists()
+    );
+    assert!(
+        inferred_target(&root)
+            .join(".c-to-rust-port/CITATION_VALIDATION.md")
+            .exists()
+    );
     assert!(root.join(".c2rust-port/knowledge/repo-map.json").exists());
+    assert!(root.join(".c2rust-port/knowledge/evidence.db").exists());
+    assert!(
+        root.join(".c2rust-port/knowledge/capability-matrix.json")
+            .exists()
+    );
+    assert!(
+        root.join(".c2rust-port/knowledge/EVIDENCE_QUERIES.md")
+            .exists()
+    );
     let repo_map =
         std::fs::read_to_string(root.join(".c2rust-port/knowledge/repo-map.md")).unwrap();
     assert!(repo_map.contains("## Process Flow"));
@@ -76,15 +107,29 @@ fn single_command_maps_makefile_repo_without_compile_commands() {
     let benchmarks =
         std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/benchmarks.jsonl"))
             .unwrap();
+    let types =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/types.jsonl")).unwrap();
+    let dataflow =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/dataflow_edges.jsonl"))
+            .unwrap();
+    let equivalence_diffs =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/equivalence_diffs.jsonl"))
+            .unwrap();
+    let capabilities =
+        std::fs::read_to_string(root.join(".c2rust-port/knowledge/facts/capabilities.jsonl"))
+            .unwrap();
     assert!(symbols.contains("\"name\":\"add\""));
     assert!(calls.contains("\"callee\":\"add\""));
     assert!(build_units.contains("math_ops.c"));
     assert!(repo_map_facts.contains("rust_mirror_module"));
     assert!(benchmarks.contains("benchmark_manifest"));
     assert!(benchmarks.contains("benchmark_run"));
+    assert!(types.is_empty() || types.contains("\"fact_type\":\"type\""));
+    assert!(dataflow.contains("function:add"));
+    assert!(equivalence_diffs.contains("\"cpp_entity\":\"add\""));
+    assert!(capabilities.contains("\"fact_type\":\"capability\""));
     let mirror =
-        std::fs::read_to_string(inferred_target(&root).join(".c-to-rust-port/RUST_MIRROR_PLAN.md"))
-            .unwrap();
+        std::fs::read_to_string(target.join(".c-to-rust-port/RUST_MIRROR_PLAN.md")).unwrap();
     assert!(mirror.contains("src/source/math_ops.rs"));
 }
 
@@ -123,6 +168,11 @@ fn single_command_packets_include_cpp_headers_and_restrictions() {
     )
     .unwrap();
     std::fs::write(source.join("widget.cpp"), "#include \"widget.hpp\"\n").unwrap();
+    std::fs::write(
+        source.join("bt2_idx.cpp"),
+        "int build_index(void) { return 0; }\n",
+    )
+    .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_c2rust-port"))
         .arg(&source)
@@ -136,26 +186,49 @@ fn single_command_packets_include_cpp_headers_and_restrictions() {
     let target = inferred_target(&source);
     let task = std::fs::read_to_string(target.join(".c-to-rust-port/units/000-source-map/TASK.md"))
         .unwrap();
-    assert!(task.contains("widget.hpp"));
+    assert!(task.contains("bt2_idx.cpp"));
+    assert!(task.contains("`indexing` source slice"));
     assert!(task.contains("Do not run Cargo"));
     assert!(task.contains("SOURCE_REPO_MAP.md"));
     assert!(task.contains("RUST_MIRROR_PLAN.md"));
+    assert!(task.contains("EVIDENCE_QUERIES.md"));
+    assert!(task.contains("CITATION_VALIDATION.md"));
+    assert!(task.contains("evidence.db"));
+    assert!(task.contains("Required Source Evidence"));
+    assert!(task.contains("Seed Citations"));
+    assert!(task.contains("facts/<table>.jsonl:<key>"));
     assert!(task.contains("Patch Contract"));
     assert!(task.contains("Do not mark an existing file as `new file mode`"));
-    let worker_system =
-        std::fs::read_to_string(target.join(".c-to-rust-port/vllm/WORKER_SYSTEM.md")).unwrap();
+    let translator =
+        std::fs::read_to_string(target.join(".c-to-rust-port/agents/01-translator.md")).unwrap();
+    let source_reviewer = std::fs::read_to_string(
+        target.join(".c-to-rust-port/agents/02-source-fidelity-reviewer.md"),
+    )
+    .unwrap();
+    let rust_reviewer =
+        std::fs::read_to_string(target.join(".c-to-rust-port/agents/03-rust-reviewer.md")).unwrap();
     let review_checklist =
-        std::fs::read_to_string(target.join(".c-to-rust-port/vllm/REVIEW_CHECKLIST.md")).unwrap();
-    let runbook = std::fs::read_to_string(target.join(".c-to-rust-port/vllm/RUNBOOK.md")).unwrap();
+        std::fs::read_to_string(target.join(".c-to-rust-port/agents/REVIEW_CHECKLIST.md")).unwrap();
+    let runbook =
+        std::fs::read_to_string(target.join(".c-to-rust-port/agents/RUNBOOK.md")).unwrap();
+    let citation_validation =
+        std::fs::read_to_string(target.join(".c-to-rust-port/CITATION_VALIDATION.json")).unwrap();
     let profile = std::fs::read_to_string(
         target.join(".c-to-rust-port/prompt_profiles/translator-default.toml"),
     )
     .unwrap();
-    assert!(worker_system.contains("Do not run commands"));
+    assert!(translator.contains("Do not run commands"));
+    assert!(translator.contains("Source Evidence"));
+    assert!(source_reviewer.contains("cited knowledge rows"));
+    assert!(source_reviewer.contains("Reject drafts without `Source Evidence` citations"));
+    assert!(rust_reviewer.contains("Review a translator draft for Rust correctness"));
     assert!(review_checklist.contains("Existing files are not marked as new files"));
-    assert!(runbook.contains("draft-only worker"));
+    assert!(review_checklist.contains("fact-row citations"));
+    assert!(runbook.contains("Codex roles"));
+    assert!(runbook.contains("evidence.db"));
+    assert!(citation_validation.contains("\"status\": \"ok\""));
     assert!(profile.contains("require_review_before_apply = true"));
-    assert!(profile.contains("forbidden_commands"));
+    assert!(profile.contains("translator_forbidden_commands"));
 }
 
 #[test]
