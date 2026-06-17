@@ -11,6 +11,9 @@ Read that file first, then load only the referenced file needed for the current 
 
 - `skills/c-to-rust-port/references/rewrite-manifesto.md` for rewrites.bio scope, validation, compatibility, disclosure, and release gates.
 - `skills/c-to-rust-port/references/tools.md` for `ccc-rs`, `tracehash`, `tracehash-compare`, and `gdb-tv`.
+- `skills/c-to-rust-port/scripts/equivalence-ladder.sh` for the compact continuous tool loop and readiness blockers.
+- `skills/c-to-rust-port/scripts/translation-repair-plan.sh` for CCC-driven missing/stubbed function implementation packets.
+- `skills/c-to-rust-port/scripts/behavior-input-plan.sh` for tracehash/gdb-tv missing-input contracts after choosing one active unit.
 - `skills/c-to-rust-port/references/roles.md` for translator/reviewer/judge/apply boundaries.
 - `skills/c-to-rust-port/references/review-schema.md` for adversarial review findings.
 - `skills/c-to-rust-port/references/repo-context.md` for repo-local `PORT_CONTEXT.md` and `.port-work/` conventions.

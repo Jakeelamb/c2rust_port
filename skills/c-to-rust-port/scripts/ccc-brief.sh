@@ -44,8 +44,21 @@ ccc-rs call-graph-diff "$rust_json" "$source_json" > "$callgraph_txt"
 ccc-rs compare-structs "$rust_json" "$source_json" --top 25 > "$structs_txt"
 ccc-rs missing-structs "$rust_json" "$source_json" > "$missing_structs_txt"
 
+if grep -q "Missing in Rust (0):" "$missing_txt" && grep -q "Partial/stubs (0):" "$missing_txt"; then
+  ccc_status=pass
+  ccc_next_action="choose the highest-risk static drift row, then require behavioral proof before closing"
+else
+  ccc_status=fail
+  ccc_next_action="run translation-repair-plan.sh for one source-backed missing/stubbed function before tracehash or gdb-tv"
+fi
+
 {
   echo "# CCC Brief"
+  echo
+  echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "truth_policy=current CCC output is authoritative for static shape; repo docs and prior artifacts are hints"
+  echo "status=$ccc_status"
+  echo "next_action=$ccc_next_action"
   echo
   echo "source=$source_dir"
   echo "rust=$rust_dir"

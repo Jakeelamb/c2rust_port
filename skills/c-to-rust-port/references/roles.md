@@ -6,7 +6,7 @@ Input:
 
 - One source unit or recursion group.
 - Relevant Rust target excerpt.
-- Compact rows from `.port-work/ccc/SUMMARY.md`, `order.csv`, or direct source inspection.
+- Compact rows from `.port-work/ccc/SUMMARY.md`, `order.csv`, a translation repair packet, or direct source inspection.
 - Current contract and verification evidence.
 - Manifesto gate status from `PORT_CONTEXT.md` or `references/rewrite-manifesto.md`.
 
@@ -20,6 +20,7 @@ Rules:
 - Preserve output formats, parse behavior, filenames, exit behavior, and unsupported-feature errors from the original surface.
 - Return source evidence, one proposed diff, and assumptions.
 - Mark any unimplemented original behavior as fail-loud, not silently ignored.
+- For missing/stubbed functions, translate only the packeted source unit; if prerequisites are absent, name the smallest prerequisite instead of inventing behavior.
 
 ## Source-Fidelity Reviewer
 
@@ -73,9 +74,11 @@ This is the only phase that edits shared files or runs commands.
 Responsibilities:
 
 - Apply accepted changes.
-- Run the smallest relevant verification command.
+- Run `scripts/equivalence-ladder.sh <source> <rust>` when source/Rust paths exist, or the smallest relevant verification command when only one tool applies.
+- If CCC reports missing/stubbed active code, run `scripts/translation-repair-plan.sh <source> <rust>`, patch one packet, and rerun CCC before tracehash/gdb-tv.
 - Capture exact pass/fail output.
 - Write or refresh compact artifacts under `.port-work/` before handing work to another agent.
+- Treat existing repo docs, ledgers, and prior artifacts as hints until refreshed by current tools.
 - If verification fails, split the report into independent fix units before launching more workers.
 - Escalate equivalence tools in this order: `ccc-rs`, tracehash hash mode, tracehash deep mode, `gdb-tv`.
 - Update `PORT_CONTEXT.md` only for reusable contract facts; keep transient failures in `.port-work/**/SUMMARY.md`.

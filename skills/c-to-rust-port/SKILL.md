@@ -5,35 +5,35 @@ description: Orchestrate faithful C/C++ to Rust ports. Use for rewrites.bio-alig
 
 # C To Rust Port
 
-Use this skill to drive a C/C++ to Rust rewrite from compact evidence. The skill owns manifesto adherence, workflow, role boundaries, tool selection, review, and equivalence escalation.
+Drive C/C++ to Rust rewrites from compact, current evidence.
 
 ## Loop
 
-1. **Contract**: read or create the minimal `PORT_CONTEXT.md` fields in `references/repo-context.md`. Check `references/rewrite-manifesto.md` before accepting scope, outputs, or validation claims.
-2. **Snapshot**: run `scripts/port-snapshot.sh <source> [rust]`. Read the compact output before opening broad files.
-3. **Queue**: run `scripts/ccc-brief.sh <source> <rust>` when `ccc-rs` is available. Use `order.csv`, `missing.txt`, constants/call-graph drift, and top deviations to choose one unit.
-4. **Packet**: load one narrow source excerpt, target excerpt, relevant compact rows, and current verification evidence. Do not load raw reports unless the compact row points there.
-5. **Draft/review**: use `references/roles.md` and `references/review-schema.md`.
-6. **Converge**: apply only accepted blockers, run the smallest proof command, and record command, result, artifact path, and remaining gap.
+1. **Contract**: create/read minimal `PORT_CONTEXT.md`; check `references/rewrite-manifesto.md` before accepting scope, validation, compatibility, or release claims.
+2. **Readiness**: run `scripts/equivalence-ladder.sh <source> <rust>` when paths exist. Then read generated `.port-work/equivalence/EQUIVALENCE.md` and follow `next_action`.
+3. **Queue**: use CCC order, missing/stub, constants, structs, call graph, and deviation summaries to choose one bottom-up unit.
+4. **Repair**: when CCC reports missing/stubbed source functions, run `scripts/translation-repair-plan.sh <source> <rust>` and implement the generated packet before behavior tools.
+5. **Behavior**: for one mapped non-stubbed unit, name the smallest fixture. Run `scripts/behavior-input-plan.sh <source> <rust>` to generate missing tracehash/gdb-tv inputs before adding probes/config. Use deep mode only after a named hash mismatch.
+6. **Packet**: load one source function, one Rust function, one compact tool row, and one failing command.
+7. **Converge**: apply confirmed blockers, run the smallest proof, and record command, result, artifact path, remaining gap, and next verification.
 
-Completion criterion: one unit has source evidence, manifesto status, a Rust patch or blocker, compact tool artifact, and a named verification/parity next step.
+Done when one unit has source evidence, manifesto status, current CCC evidence, and either behavioral proof or a concrete missing-input blocker.
 
 ## Rules
 
-- Tools before guesses. If a cheap tool can answer the question, run it or ask apply/converge to run it.
-- Use the fixed ladder: `ccc-rs` for static queue and shape, `tracehash` hash mode for behavioral mismatch, `tracehash` deep mode for values, `gdb-tv` for debugger-level first divergence when conditions fit.
-- Summaries before raw data. Prefer `.port-work/**/SUMMARY.md`, TSV top-N output, and first-divergence rows.
-- Source/Rust name matches are hypotheses until backed by static, trace, debugger, or direct source evidence.
-- Output diffs and benchmarks are acceptance gates, not the main discovery mechanism.
+- Fresh tool output beats README, STATUS, memory, prior `.port-work`, and old notes.
+- Do not close a unit on CCC alone; CCC queues/blocks, behavior proves.
+- A missing/stubbed active source unit is an implementation queue, not a stop: generate a repair packet, patch one unit, then rerun CCC.
+- Zero-row tracehash, project-specific TSVs, missing GDB configs, optimized binaries, and multithreaded debugger runs are blockers.
+- Broad CCC missing does not forbid unit-scoped behavior work; choose one mapped non-stubbed unit first.
+- Prefer `.port-work/**/SUMMARY.md`, top-N rows, and first-divergence rows before raw reports.
+- Never benchmark until output/trace/debugger parity is plausible.
 - Worker phases are no-build and no-mutation. Apply/converge owns edits and commands.
-- Treat performance or memory deltas in either direction as regressions until evidence explains them.
-- Emulate exactly unless `PORT_CONTEXT.md` says otherwise: filenames, headers, columns, ordering, parsing, exit behavior, summaries, numeric precision, and unsupported flags.
-- Fail loudly for out-of-scope features. Never silently ignore an original CLI flag, format field, error path, or validation gap.
+- Emulate exactly unless `PORT_CONTEXT.md` says otherwise: filenames, headers, columns, ordering, parsing, exits, summaries, numeric precision, unsupported flags.
 
 ## References
 
-- `references/rewrite-manifesto.md`: when setting scope, validation, compatibility, disclosure, and release claims.
-- `references/tools.md`: when choosing or interpreting `ccc-rs`, `tracehash`, `gdb-tv`, output diffs, and benchmarks.
-- `references/roles.md`: when launching translator/reviewer/judge/apply phases.
-- `references/review-schema.md`: when writing or judging adversarial findings.
-- `references/repo-context.md`: when setting up repo-local domain language and artifact paths.
+- `references/tools.md`: tool order, readiness, cadence, and interpretation.
+- `references/roles.md`: translator/reviewer/judge/apply boundaries.
+- `references/review-schema.md`: adversarial findings.
+- `references/repo-context.md`: `PORT_CONTEXT.md` and artifact paths.

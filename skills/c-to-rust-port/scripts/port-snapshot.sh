@@ -35,7 +35,28 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1 && echo yes || echo no
 }
 
+git_ref() {
+  local root=$1
+  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown
+  else
+    echo none
+  fi
+}
+
+git_dirty_count() {
+  local root=$1
+  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$root" status --short 2>/dev/null | wc -l | tr -d ' '
+  else
+    echo na
+  fi
+}
+
 echo "# Port Snapshot"
+echo
+echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "truth_policy=fresh tool output beats repo docs, ledgers, memory, and prior artifacts"
 echo
 echo "source=$source_dir"
 if [[ -n "$rust_dir" ]]; then
@@ -48,12 +69,16 @@ echo "cpp_files=$(count_files "$source_dir" -name '*.cc' -o -name '*.cpp' -o -na
 echo "makefile=$([[ -f "$source_dir/Makefile" || -f "$source_dir/makefile" ]] && echo yes || echo no)"
 echo "cmake=$([[ -f "$source_dir/CMakeLists.txt" ]] && echo yes || echo no)"
 echo "compile_commands=$([[ -f "$source_dir/compile_commands.json" ]] && echo yes || echo no)"
+echo "git_head=$(git_ref "$source_dir")"
+echo "git_dirty_count=$(git_dirty_count "$source_dir")"
 echo
 if [[ -n "$rust_dir" ]]; then
   echo "## Rust"
   echo "rust_files=$(count_files "$rust_dir" -name '*.rs')"
   echo "cargo_toml=$([[ -f "$rust_dir/Cargo.toml" ]] && echo yes || echo no)"
   echo "port_context=$([[ -f "$rust_dir/PORT_CONTEXT.md" ]] && echo yes || echo no)"
+  echo "git_head=$(git_ref "$rust_dir")"
+  echo "git_dirty_count=$(git_dirty_count "$rust_dir")"
   echo
 fi
 echo "## Tools"
@@ -61,7 +86,13 @@ for tool in ccc-rs tracehash-compare gdb-tv rg git cargo cc clang gdb; do
   echo "$tool=$(has_cmd "$tool")"
 done
 echo
-echo "## Existing Compact Artifacts"
+echo "## Behavior Inputs"
+echo "tracehash_rust=$([[ -n "${TRACEHASH_RUST:-}" ]] && echo "$TRACEHASH_RUST" || echo missing)"
+echo "tracehash_source=$([[ -n "${TRACEHASH_SOURCE:-}" ]] && echo "$TRACEHASH_SOURCE" || echo missing)"
+echo "gdb_tv_config=$([[ -n "${GDB_TV_CONFIG:-}" ]] && echo "$GDB_TV_CONFIG" || echo missing)"
+echo
+echo "## Prior Compact Artifacts"
+echo "These are hints only. Refresh before using as proof."
 found_artifact=0
 for path in \
   "$source_dir/PORT_CONTEXT.md" \
