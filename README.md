@@ -16,9 +16,9 @@ Cursor shim:
 
 The skill coordinates C/C++ to Rust ports around source-backed evidence, bottom-up translation order, adversarial review, and targeted equivalence tools:
 
+- `rewrites.bio` manifesto gates for credit, exact emulation, AI transparency, real-data validation, pinned versions, compatibility, and fail-loud scope.
 - `ccc-rs` / code-complexity-comparator for static shape, missing function, constants, call-graph, and bottom-up order checks.
 - `tracehash` / `tracehash-compare` for paired function I/O trace parity.
 - `gdb-tv` / gdb-translation-verifier-rs for single-threaded debugger-level divergence localization.
-- `rewrites.bio` and `rustification` as policy context for maintained, faithful bioinformatics rewrites.
 
 The active design follows Matt Pocock-style skill mechanics: compact model-invoked routing, one-loop completion criteria, tool-generated summaries before raw data, and branch-specific references loaded only when needed.

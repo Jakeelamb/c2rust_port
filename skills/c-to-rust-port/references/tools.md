@@ -1,6 +1,15 @@
 # Tool Guide
 
-Use compact artifacts before raw outputs. Default generated path: `.port-work/`.
+Use compact artifacts before raw outputs. Default generated path: `.port-work/`. Never open raw reports unless a compact summary identifies the function, sync point, or first mismatch to inspect.
+
+## Decision Ladder
+
+1. **Snapshot**: learn tool availability, repo shape, prior artifacts.
+2. **CCC**: pick bottom-up work, find missing/stubbed functions, static shape drift, constants drift, struct drift, call-graph drift, and floating-point operator drift.
+3. **Tracehash hash mode**: after both sides have matching code, compare `function + input_hash -> output_hash` for the smallest reproducible case.
+4. **Tracehash deep mode**: only after hash mode localizes a mismatch and scalar/struct values are needed.
+5. **gdb-tv**: when instrumentation is too invasive, or when debugger-level first divergence is cheaper and both binaries are single-threaded, debug, and similarly shaped.
+6. **Output/benchmark gates**: after local parity is plausible, prove user-visible compatibility and performance on real data.
 
 ## Snapshot
 
@@ -47,6 +56,8 @@ Use results this way:
 - `compare`: inspect highest complexity deviations before accepting a translation.
 - `constants-diff`: inspect magic number, string, and float drift.
 - `call-graph-diff`: inspect structural rewiring and recursion mismatch.
+- `compare-structs` / `missing-structs`: inspect layout-sensitive structs, records, and data models.
+- `binary_operators` drift: treat arithmetic operator changes as high-risk for floating-point rounding and precision.
 
 Do not treat a clean static comparison as behavioral parity.
 
@@ -65,6 +76,7 @@ Principles:
 Typical comparison:
 
 ```bash
+skills/c-to-rust-port/scripts/tracehash-brief.sh /tmp/rust.tsv /tmp/c.tsv
 tracehash-compare /tmp/rust.tsv /tmp/c.tsv
 tracehash-compare --only suspicious_fn --first 50 /tmp/rust.tsv /tmp/c.tsv
 tracehash-compare --summary-only /tmp/rust.tsv /tmp/c.tsv
@@ -75,6 +87,8 @@ Interpretation:
 - Count differences usually mean control-flow drift before or inside that function.
 - Same input hash with different output hash means local behavior drift.
 - Missing inputs mean one side reached different states or skipped cases.
+
+Escalate to deep mode only when the hash summary has named the first suspicious function and values are required. Keep `TRACEHASH_DEEP_MODE` narrow (`first:N`, `TRACEHASH_DEEP_ONLY`) unless the fixture is tiny.
 
 ## gdb-tv
 
@@ -90,6 +104,7 @@ Required conditions:
 Typical sync-mode invocation:
 
 ```bash
+skills/c-to-rust-port/scripts/gdb-tv-brief.sh config.toml
 gdb-tv \
   --c-bin /path/to/reference \
   --rust-bin /path/to/port \
@@ -101,7 +116,7 @@ gdb-tv \
 
 Use TOML config for non-trivial sync points, argument maps, watch expressions, and skip lists.
 
-Do not use `gdb-tv` for optimized or multithreaded targets.
+Do not use `gdb-tv` for optimized or multithreaded targets. Prefer sync-point mode before trace mode; trace mode needs skip lists or it will waste time in runtime/library frames.
 
 ## Benchmark And Output Gates
 
@@ -113,3 +128,4 @@ Rules:
 - Real datasets before performance claims.
 - Compare both CLI and library surfaces when the Rust port exposes a library path.
 - Treat speedups as suspicious until explained; many false wins come from skipped work or unfair setup.
+- Every equivalence claim names original version, Rust commit/version, input data, command lines, hardware, and artifact path.

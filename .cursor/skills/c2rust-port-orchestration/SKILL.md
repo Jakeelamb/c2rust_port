@@ -9,6 +9,7 @@ Canonical skill source: `skills/c-to-rust-port/SKILL.md`.
 
 Read that file first, then load only the referenced file needed for the current task:
 
+- `skills/c-to-rust-port/references/rewrite-manifesto.md` for rewrites.bio scope, validation, compatibility, disclosure, and release gates.
 - `skills/c-to-rust-port/references/tools.md` for `ccc-rs`, `tracehash`, `tracehash-compare`, and `gdb-tv`.
 - `skills/c-to-rust-port/references/roles.md` for translator/reviewer/judge/apply boundaries.
 - `skills/c-to-rust-port/references/review-schema.md` for adversarial review findings.

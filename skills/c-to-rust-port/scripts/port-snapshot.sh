@@ -62,12 +62,16 @@ for tool in ccc-rs tracehash-compare gdb-tv rg git cargo cc clang gdb; do
 done
 echo
 echo "## Existing Compact Artifacts"
+found_artifact=0
 for path in \
   "$source_dir/PORT_CONTEXT.md" \
   "$source_dir/.port-work/ccc/SUMMARY.md" \
   "$source_dir/.port-work/tracehash/SUMMARY.md" \
   "$source_dir/.port-work/gdb-tv/SUMMARY.md"; do
-  [[ -f "$path" ]] && echo "$path"
+  if [[ -f "$path" ]]; then
+    echo "$path"
+    found_artifact=1
+  fi
 done
 if [[ -n "$rust_dir" ]]; then
   for path in \
@@ -75,6 +79,12 @@ if [[ -n "$rust_dir" ]]; then
     "$rust_dir/.port-work/ccc/SUMMARY.md" \
     "$rust_dir/.port-work/tracehash/SUMMARY.md" \
     "$rust_dir/.port-work/gdb-tv/SUMMARY.md"; do
-    [[ -f "$path" ]] && echo "$path"
+    if [[ -f "$path" ]]; then
+      echo "$path"
+      found_artifact=1
+    fi
   done
+fi
+if [[ "$found_artifact" -eq 0 ]]; then
+  echo "(none)"
 fi
