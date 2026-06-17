@@ -10,6 +10,8 @@ Optional env:
   ACTIVE_FIXTURE='command or fixture path'
   SOURCE_BIN=/path/debug-c-bin
   RUST_BIN=/path/debug-rust-bin
+  SOURCE_CMD='command that writes source trace when TRACEHASH_OUT is set'
+  RUST_CMD='command that writes rust trace when TRACEHASH_OUT is set'
 EOF
 }
 
@@ -25,12 +27,18 @@ active_fn=${ACTIVE_FUNCTION:-}
 active_fixture=${ACTIVE_FIXTURE:-}
 source_bin=${SOURCE_BIN:-}
 rust_bin=${RUST_BIN:-}
+source_cmd=${SOURCE_CMD:-}
+rust_cmd=${RUST_CMD:-}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 mkdir -p "$out_dir"
 
 summary="$out_dir/SUMMARY.md"
 tracehash_plan="$out_dir/tracehash-inputs.md"
 gdb_template="$out_dir/gdb-tv-config.template.toml"
+fixture_dir="$out_dir/fixtures"
+tracehash_scaffold_dir="$out_dir/tracehash-scaffold"
+gdb_config_dir="$out_dir/gdb-tv-config"
 
 missing=()
 [[ -n "$active_fn" ]] || missing+=("ACTIVE_FUNCTION")
@@ -102,6 +110,15 @@ timeout = 30
 max_steps = 1000
 EOF
 
+set +e
+fixture_summary=$(ACTIVE_FUNCTION="$active_fn" "$script_dir/fixture-discovery.sh" "$source_dir" "$rust_dir" "$fixture_dir" 2> "$out_dir/fixture-discovery.err")
+fixture_status=$?
+tracehash_scaffold_summary=$(ACTIVE_FUNCTION="$active_fn" ACTIVE_FIXTURE="$active_fixture" SOURCE_CMD="$source_cmd" RUST_CMD="$rust_cmd" "$script_dir/tracehash-scaffold.sh" "$source_dir" "$rust_dir" "$tracehash_scaffold_dir" 2> "$out_dir/tracehash-scaffold.err")
+tracehash_scaffold_status=$?
+gdb_config_summary=$(ACTIVE_FUNCTION="$active_fn" ACTIVE_FIXTURE="$active_fixture" SOURCE_BIN="$source_bin" RUST_BIN="$rust_bin" "$script_dir/gdb-tv-config-builder.sh" "$source_dir" "$rust_dir" "$gdb_config_dir" 2> "$out_dir/gdb-tv-config.err")
+gdb_config_status=$?
+set -e
+
 {
   echo "# Behavior Input Plan"
   echo
@@ -126,6 +143,9 @@ EOF
   echo "## Artifacts"
   echo "- tracehash plan: $tracehash_plan"
   echo "- gdb-tv config template: $gdb_template"
+  echo "- fixture discovery: $fixture_status ${fixture_summary:+($fixture_summary)}"
+  echo "- tracehash scaffold: $tracehash_scaffold_status ${tracehash_scaffold_summary:+($tracehash_scaffold_summary)}"
+  echo "- gdb-tv config builder: $gdb_config_status ${gdb_config_summary:+($gdb_config_summary)}"
 } > "$summary"
 
 echo "$summary"

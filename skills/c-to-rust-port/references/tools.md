@@ -7,8 +7,8 @@ Use compact artifacts before raw outputs. Default generated path: `.port-work/`.
 1. **Snapshot/readiness**: learn tool availability, source/Rust roots, fixture paths, debug binaries, prior compact artifacts, and dirty counts.
 2. **CCC upfront**: pick bottom-up work, find missing/stubbed functions, static shape drift, constants drift, struct drift, call-graph drift, and floating-point operator drift.
 3. **Translation repair**: when the active unit is missing/stubbed, run `translation-repair-plan.sh` and patch exactly one source-backed function packet.
-4. **Fixture contract**: name the smallest reproducible input and active function family before any behavioral tool.
-5. **Behavior input plan**: run `behavior-input-plan.sh` for the chosen mapped non-stubbed unit before editing probes or configs.
+4. **Fixture contract**: run `fixture-discovery.sh` or use behavior-input artifacts to choose the smallest reproducible input and active function family.
+5. **Behavior input plan**: run `behavior-input-plan.sh` for the chosen mapped non-stubbed unit; it emits fixture, tracehash, and gdb-tv scaffolds before edits.
 6. **Tracehash hash mode**: after both sides have matching code and paired probes, compare `function + input_hash -> output_hash`.
 7. **Tracehash deep mode**: only after hash mode localizes a mismatch and scalar/struct values are needed.
 8. **gdb-tv**: when instrumentation is too invasive/ambiguous, or when debugger-level first divergence is cheaper and both binaries are single-threaded, debug, and similarly shaped.
@@ -19,7 +19,7 @@ Use compact artifacts before raw outputs. Default generated path: `.port-work/`.
 
 - Every session: snapshot + CCC.
 - Every missing/stubbed active unit: one translation repair packet, one source function, one Rust target, one rerun of CCC.
-- Every behavior unit: one CCC row, one source/Rust pair, one smallest fixture.
+- Every behavior unit: one CCC row, one source/Rust pair, one fixture-discovery summary, one smallest fixture.
 - When tracehash/gdb-tv inputs are missing: produce a behavior input plan, not a fake run.
 - After each patch: targeted CCC if structure changed; targeted tracehash when probes exist.
 - Escalate to `gdb-tv` only for hard divergence, invasive instrumentation, or unclear tracehash results.
@@ -49,6 +49,12 @@ ACTIVE_FUNCTION=fn CCC_DIR=.port-work/equivalence/ccc \
   skills/c-to-rust-port/scripts/translation-repair-plan.sh <source-dir> <rust-dir>
 ACTIVE_FUNCTION=fn ACTIVE_FIXTURE='fixture command' \
   skills/c-to-rust-port/scripts/behavior-input-plan.sh <source-dir> <rust-dir>
+ACTIVE_FUNCTION=fn \
+  skills/c-to-rust-port/scripts/fixture-discovery.sh <source-dir> <rust-dir>
+ACTIVE_FUNCTION=fn ACTIVE_FIXTURE='fixture command' \
+  skills/c-to-rust-port/scripts/tracehash-scaffold.sh <source-dir> <rust-dir>
+ACTIVE_FUNCTION=fn ACTIVE_FIXTURE='fixture arg' SOURCE_BIN=/path/c RUST_BIN=/path/rust \
+  skills/c-to-rust-port/scripts/gdb-tv-config-builder.sh <source-dir> <rust-dir>
 TRACEHASH_RUST=rust.tsv TRACEHASH_SOURCE=c.tsv TRACEHASH_ONLY=fn \
   skills/c-to-rust-port/scripts/equivalence-ladder.sh <source-dir> <rust-dir>
 GDB_TV_CONFIG=.port-work/gdb-tv/config.toml \
@@ -83,12 +89,15 @@ Rules:
 | `ccc missing` or stubs | Run `translation-repair-plan.sh`; implement/map one source-backed packet before tracehash or gdb-tv. |
 | broad `ccc missing` but one mapped unit exists | Pick that active unit and run `behavior-input-plan.sh`. |
 | repair packet says dependency missing | Run `translation-repair-plan.sh` for the smallest prerequisite function first. |
+| no obvious fixture | Run `fixture-discovery.sh`; choose the smallest candidate that reaches the active function. |
 | `ccc constants-diff` | Inspect source constants/strings before changing behavior. |
 | `ccc binary_operators` drift | Suspect numeric order, dropped terms, or changed branch conditions. |
 | `tracehash zero comparable rows` | Build real paired tracehash probes; do not compare arbitrary TSVs. |
+| tracehash probes missing | Run `tracehash-scaffold.sh`; patch paired probes only for the active function/fixture. |
 | `tracehash count differences` | Add/check branch or control-flow probes before downstream values. |
 | `tracehash same input, different output` | Patch only that function; deep mode only if values are still needed. |
 | `gdb-tv missing config` | Create debug binary paths, fixture args, sync/entry, and name maps. |
+| `gdb-tv` inputs missing | Run `gdb-tv-config-builder.sh`; do not invoke debugger until status is `ready_to_run`. |
 | `gdb-tv func_mismatch` | Fix sync point/name_map; not code evidence yet. |
 | `gdb-tv arg_mismatch` | Add `arg_map`/`watch_map`; compare only semantic equivalents. |
 | `gdb-tv return_value_mismatch` | Patch the synced function body, then rerun the same config. |
@@ -155,9 +164,13 @@ ACTIVE_FUNCTION=fn REPAIR_KIND=stub \
   skills/c-to-rust-port/scripts/translation-repair-plan.sh <source-dir> <rust-dir>
 ```
 
-Read only `SUMMARY.md`, `IMPLEMENTATION_PACKET.md`, the selected `source-function.json`, the source snippet, and the nearest Rust candidate. The packet is a work order, not proof. Implement one function, rerun CCC, then continue to behavior input planning only after the active unit is no longer missing/stubbed.
+Read only `SUMMARY.md`, `IMPLEMENTATION_PACKET.md`, candidate TSVs, the selected `source-function.json`, the source snippet, and the nearest Rust candidate. The packet is a work order, not proof. Implement one function, rerun CCC, then continue to behavior input planning only after the active unit is no longer missing/stubbed.
 
 `equivalence-ladder.sh` creates this packet automatically under `.port-work/equivalence/translation-repair/` when CCC blocks on missing/stubbed functions.
+
+## Fixtures
+
+Use `fixture-discovery.sh` before inventing fixtures. It ranks bounded data files and test/parity hints and writes `fixture-candidates.tsv`, `test-hints.txt`, and `command-hints.md`. Candidate rows are hints; only executing the fixture proves it reaches the active function.
 
 ## tracehash
 
@@ -174,6 +187,8 @@ Principles:
 Typical comparison:
 
 ```bash
+ACTIVE_FUNCTION=fn ACTIVE_FIXTURE='fixture command' \
+  skills/c-to-rust-port/scripts/tracehash-scaffold.sh <source-dir> <rust-dir>
 skills/c-to-rust-port/scripts/tracehash-brief.sh /tmp/rust.tsv /tmp/c.tsv
 tracehash-compare /tmp/rust.tsv /tmp/c.tsv
 tracehash-compare --only suspicious_fn --first 50 /tmp/rust.tsv /tmp/c.tsv
@@ -215,6 +230,7 @@ gdb-tv \
 ```
 
 Use TOML config for non-trivial sync points, argument maps, watch expressions, and skip lists.
+Use `gdb-tv-config-builder.sh` to emit a config and readiness summary before invoking `gdb-tv-brief.sh`.
 
 Do not use `gdb-tv` for optimized or multithreaded targets. Prefer sync-point mode before trace mode; trace mode needs skip lists or it will waste time in runtime/library frames.
 Rust frames often include module prefixes such as `crate::module::func`; map C leaf names with anchored regexes such as `^func$=^(?:.+::)?func$`.

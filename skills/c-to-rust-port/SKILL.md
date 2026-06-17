@@ -13,7 +13,7 @@ Drive C/C++ to Rust rewrites from compact, current evidence.
 2. **Readiness**: run `scripts/equivalence-ladder.sh <source> <rust>` when paths exist. Then read generated `.port-work/equivalence/EQUIVALENCE.md` and follow `next_action`.
 3. **Queue**: use CCC order, missing/stub, constants, structs, call graph, and deviation summaries to choose one bottom-up unit.
 4. **Repair**: when CCC reports missing/stubbed source functions, run `scripts/translation-repair-plan.sh <source> <rust>` and implement the generated packet before behavior tools.
-5. **Behavior**: for one mapped non-stubbed unit, name the smallest fixture. Run `scripts/behavior-input-plan.sh <source> <rust>` to generate missing tracehash/gdb-tv inputs before adding probes/config. Use deep mode only after a named hash mismatch.
+5. **Behavior**: for one mapped non-stubbed unit, name the smallest fixture. Run `scripts/behavior-input-plan.sh <source> <rust>` to discover fixtures and scaffold tracehash/gdb-tv inputs before adding probes/config. Use deep mode only after a named hash mismatch.
 6. **Packet**: load one source function, one Rust function, one compact tool row, and one failing command.
 7. **Converge**: apply confirmed blockers, run the smallest proof, and record command, result, artifact path, remaining gap, and next verification.
 
@@ -25,6 +25,7 @@ Done when one unit has source evidence, manifesto status, current CCC evidence, 
 - Do not close a unit on CCC alone; CCC queues/blocks, behavior proves.
 - A missing/stubbed active source unit is an implementation queue, not a stop: generate a repair packet, patch one unit, then rerun CCC.
 - Zero-row tracehash, project-specific TSVs, missing GDB configs, optimized binaries, and multithreaded debugger runs are blockers.
+- Missing fixtures, probes, or debug configs are input-generation work: use the scaffold summaries before inventing commands.
 - Broad CCC missing does not forbid unit-scoped behavior work; choose one mapped non-stubbed unit first.
 - Prefer `.port-work/**/SUMMARY.md`, top-N rows, and first-divergence rows before raw reports.
 - Never benchmark until output/trace/debugger parity is plausible.

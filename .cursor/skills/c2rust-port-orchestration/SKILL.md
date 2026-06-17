@@ -13,7 +13,10 @@ Read that file first, then load only the referenced file needed for the current 
 - `skills/c-to-rust-port/references/tools.md` for `ccc-rs`, `tracehash`, `tracehash-compare`, and `gdb-tv`.
 - `skills/c-to-rust-port/scripts/equivalence-ladder.sh` for the compact continuous tool loop and readiness blockers.
 - `skills/c-to-rust-port/scripts/translation-repair-plan.sh` for CCC-driven missing/stubbed function implementation packets.
-- `skills/c-to-rust-port/scripts/behavior-input-plan.sh` for tracehash/gdb-tv missing-input contracts after choosing one active unit.
+- `skills/c-to-rust-port/scripts/fixture-discovery.sh` for ranked fixture and test-surface candidates.
+- `skills/c-to-rust-port/scripts/behavior-input-plan.sh` for missing-input contracts after choosing one active unit.
+- `skills/c-to-rust-port/scripts/tracehash-scaffold.sh` for paired probe templates and compare commands.
+- `skills/c-to-rust-port/scripts/gdb-tv-config-builder.sh` for debugger config readiness and templates.
 - `skills/c-to-rust-port/references/roles.md` for translator/reviewer/judge/apply boundaries.
 - `skills/c-to-rust-port/references/review-schema.md` for adversarial review findings.
 - `skills/c-to-rust-port/references/repo-context.md` for repo-local `PORT_CONTEXT.md` and `.port-work/` conventions.

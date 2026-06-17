@@ -63,13 +63,31 @@ source_json="$ccc_dir/source.json"
 rust_json="$ccc_dir/rust.json"
 order_csv="$ccc_dir/order.csv"
 missing_txt="$ccc_dir/missing.txt"
+source_functions_tsv="$out_dir/source-functions.tsv"
+missing_candidates_tsv="$out_dir/missing-candidates.tsv"
+stub_candidates_tsv="$out_dir/stub-candidates.tsv"
+
+jq -r '
+  .functions[]
+  | [
+      .name,
+      .location.file,
+      .location.line_start,
+      .location.line_end,
+      (.metrics.loc_code // 0),
+      (.metrics.branches // 0),
+      (.metrics.calls_unique // 0),
+      (.metrics.cyclomatic // 0),
+      (.metrics.cognitive // 0)
+    ]
+  | @tsv
+' "$source_json" > "$source_functions_tsv"
 
 pick_stub_pair() {
-  local best_rust=""
-  local best_source=""
-  local best_loc=999999
   local in_partial=0
-  local line rust_name source_name rust_loc source_loc
+  local line rust_name source_name rust_loc source_loc leaf score reason
+  local raw="$out_dir/stub-candidates.raw.tsv"
+  : > "$raw"
 
   while IFS= read -r line; do
     if [[ "$line" == Partial/stubs* ]]; then
@@ -87,20 +105,40 @@ pick_stub_pair() {
       rust_loc=${BASH_REMATCH[3]}
       source_loc=${BASH_REMATCH[4]}
       if [[ -n "$active_fn" ]]; then
-        if [[ "$rust_name" == "$active_fn" || "$source_name" == "$active_fn" || "$source_name" == *"::$active_fn" ]]; then
-          printf '%s\t%s\t%s\t%s\n' "$rust_name" "$source_name" "$rust_loc" "$source_loc"
-          return 0
-        fi
-      elif [[ "$source_loc" -lt "$best_loc" ]]; then
-        best_rust=$rust_name
-        best_source=$source_name
-        best_loc=$source_loc
+        [[ "$rust_name" == "$active_fn" || "$source_name" == "$active_fn" || "$source_name" == *"::$active_fn" ]] || continue
       fi
+      leaf=${source_name##*::}
+      score=0
+      reason=""
+      if (( source_loc >= 8 && source_loc <= 180 )); then
+        score=$((score + 80))
+        reason="${reason}loc_fit,"
+      elif (( source_loc >= 4 && source_loc <= 320 )); then
+        score=$((score + 35))
+        reason="${reason}loc_ok,"
+      else
+        score=$((score - 45))
+        reason="${reason}loc_poor,"
+      fi
+      if (( rust_loc <= 12 )); then
+        score=$((score + 25))
+        reason="${reason}stub_short,"
+      fi
+      if [[ "$source_name" == *::* ]]; then
+        score=$((score + 15))
+        reason="${reason}method,"
+      fi
+      if [[ ${#leaf} -le 2 || "$leaf" =~ ^(operator|iterator|begin|end|size|empty|clear|reset|free|swap|new|delete|main|o|c|get|set|init|print|close|open|load|save|done|next|prev|read|write)$ ]]; then
+        score=$((score - 70))
+        reason="${reason}generic_name,"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$score" "${reason%,}" "$rust_name" "$source_name" "$rust_loc" "$source_loc" >> "$raw"
     fi
   done < "$missing_txt"
 
-  if [[ -n "$best_source" ]]; then
-    printf '%s\t%s\t\t%s\n' "$best_rust" "$best_source" "$best_loc"
+  if [[ -s "$raw" ]]; then
+    sort -t $'\t' -k1,1nr -k6,6n "$raw" > "$stub_candidates_tsv"
+    head -n 1 "$stub_candidates_tsv"
     return 0
   fi
 
@@ -108,23 +146,86 @@ pick_stub_pair() {
 }
 
 pick_missing_order_row() {
-  if [[ -n "$active_fn" ]]; then
-    awk -F, -v fn="$active_fn" '
-      NR == 1 { next }
-      toupper($6) != "FALSE" { next }
-      $2 !~ /\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/ { next }
-      $2 ~ /\/scripts\/|\/test\// { next }
-      $1 == fn || $1 ~ ("::" fn "$") { print; exit }
-    ' "$order_csv"
-  else
-    awk -F, '
-      NR == 1 { next }
-      toupper($6) != "FALSE" { next }
-      $2 !~ /\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/ { next }
-      $2 ~ /\/scripts\/|\/test\// { next }
-      { print; exit }
-    ' "$order_csv"
+  local raw="$out_dir/missing-candidates.raw.tsv"
+  awk -F'\t' -v order_csv="$order_csv" -v fn="$active_fn" '
+    function leaf_name(name, x) { x = name; sub(/^.*::/, "", x); return x }
+    function is_generic(name, leaf) {
+      leaf = leaf_name(name)
+      return length(leaf) <= 2 || leaf ~ /^(operator|iterator|begin|end|size|empty|clear|reset|free|swap|new|delete|main|o|c|get|set|init|print|close|open|load|save|done|next|prev|read|write)$/
+    }
+    function add_reason(reason, part) {
+      if (reason == "") return part
+      return reason "," part
+    }
+    FNR == NR {
+      key = $2 ":" $3
+      source[key] = $0
+      next
+    }
+    END {
+      OFS = "\t"
+      while ((getline line < order_csv) > 0) {
+        if (line ~ /^name,/) continue
+        n = split(line, cols, ",")
+        if (n < 6) continue
+        order_name = cols[1]
+        file = cols[2]
+        start = cols[3]
+        translated = toupper(cols[6])
+        if (translated != "FALSE") continue
+        if (file !~ /\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/) continue
+        if (file ~ /\/scripts\/|\/test\/|\/tests\/|\/benchmark\//) continue
+        key = file ":" start
+        if (!(key in source)) continue
+        split(source[key], f, "\t")
+        name = f[1]
+        if (fn != "" && name != fn && name !~ ("::" fn "$") && order_name != fn && order_name !~ ("::" fn "$")) continue
+        end = f[4]
+        loc = f[5] + 0
+        branches = f[6] + 0
+        calls = f[7] + 0
+        cyclo = f[8] + 0
+        cognitive = f[9] + 0
+        score = 0
+        reason = ""
+        if (loc >= 8 && loc <= 180) {
+          score += 80; reason = add_reason(reason, "loc_fit")
+        } else if (loc >= 4 && loc <= 320) {
+          score += 35; reason = add_reason(reason, "loc_ok")
+        } else {
+          score -= 45; reason = add_reason(reason, "loc_poor")
+        }
+        if (branches > 0 && branches <= 45) {
+          score += 35; reason = add_reason(reason, "bounded_branches")
+        } else if (branches == 0) {
+          score -= 10; reason = add_reason(reason, "no_branches")
+        } else {
+          score -= 25; reason = add_reason(reason, "too_branchy")
+        }
+        if (calls > 0 && calls <= 80) {
+          score += 15; reason = add_reason(reason, "has_calls")
+        }
+        if (name ~ /::/) {
+          score += 15; reason = add_reason(reason, "method")
+        }
+        if (is_generic(name)) {
+          score -= 70; reason = add_reason(reason, "generic_name")
+        }
+        if (file ~ /\.(h|hh|hpp|hxx)$/ && loc <= 6) {
+          score -= 20; reason = add_reason(reason, "tiny_header")
+        }
+        print score, reason, name, file, start, end, loc, branches, calls, cyclo, cognitive
+      }
+    }
+  ' "$source_functions_tsv" > "$raw"
+
+  if [[ -s "$raw" ]]; then
+    sort -t $'\t' -k1,1nr -k7,7n "$raw" > "$missing_candidates_tsv"
+    head -n 1 "$missing_candidates_tsv"
+    return 0
   fi
+
+  return 1
 }
 
 kind=""
@@ -136,21 +237,36 @@ source_end=""
 rust_file=""
 rust_start=""
 rust_end=""
+selection_score=""
+selection_reason=""
 
-if [[ "$repair_kind" != "stub" ]]; then
-  missing_row=$(pick_missing_order_row || true)
-  if [[ -n "$missing_row" ]]; then
-    IFS=, read -r source_name source_file source_start _scc_id _scc_kind _translated <<< "$missing_row"
+missing_row=""
+stub_row=""
+[[ "$repair_kind" == "stub" ]] || missing_row=$(pick_missing_order_row || true)
+[[ "$repair_kind" == "missing" ]] || stub_row=$(pick_stub_pair || true)
+
+if [[ "$repair_kind" == "missing" && -n "$missing_row" ]]; then
+  IFS=$'\t' read -r selection_score selection_reason source_name source_file source_start source_end _loc _branches _calls _cyclo _cog <<< "$missing_row"
+  kind=missing
+elif [[ "$repair_kind" == "stub" && -n "$stub_row" ]]; then
+  IFS=$'\t' read -r selection_score selection_reason rust_name source_name _rust_loc _source_loc <<< "$stub_row"
+  kind=stub
+elif [[ -n "$missing_row" && -n "$stub_row" ]]; then
+  missing_score=${missing_row%%$'\t'*}
+  stub_score=${stub_row%%$'\t'*}
+  if (( stub_score > missing_score )); then
+    IFS=$'\t' read -r selection_score selection_reason rust_name source_name _rust_loc _source_loc <<< "$stub_row"
+    kind=stub
+  else
+    IFS=$'\t' read -r selection_score selection_reason source_name source_file source_start source_end _loc _branches _calls _cyclo _cog <<< "$missing_row"
     kind=missing
   fi
-fi
-
-if [[ -z "$kind" && "$repair_kind" != "missing" ]]; then
-  stub_row=$(pick_stub_pair || true)
-  if [[ -n "$stub_row" ]]; then
-    IFS=$'\t' read -r rust_name source_name _rust_loc _source_loc <<< "$stub_row"
-    kind=stub
-  fi
+elif [[ -n "$missing_row" ]]; then
+  IFS=$'\t' read -r selection_score selection_reason source_name source_file source_start source_end _loc _branches _calls _cyclo _cog <<< "$missing_row"
+  kind=missing
+elif [[ -n "$stub_row" ]]; then
+  IFS=$'\t' read -r selection_score selection_reason rust_name source_name _rust_loc _source_loc <<< "$stub_row"
+  kind=stub
 fi
 
 if [[ -z "$kind" && -n "$active_fn" ]]; then
@@ -272,6 +388,8 @@ fi
   echo "ccc=$ccc_dir"
   echo "kind=$kind"
   echo "active_function=${active_fn:-auto}"
+  echo "selection_score=${selection_score:-missing}"
+  echo "selection_reason=${selection_reason:-missing}"
   echo
   echo "## Selected Unit"
   echo "- source: ${source_name:-unknown} ${source_file:+($source_file:$source_start)}"
@@ -286,6 +404,8 @@ fi
   fi
   echo
   echo "## Artifacts"
+  [[ -f "$missing_candidates_tsv" ]] && echo "- missing candidates: $missing_candidates_tsv"
+  [[ -f "$stub_candidates_tsv" ]] && echo "- stub candidates: $stub_candidates_tsv"
   [[ -f "$source_function_json" ]] && echo "- source function json: $source_function_json"
   [[ -f "$source_snippet" ]] && echo "- source snippet: $source_snippet"
   [[ -f "$rust_function_json" ]] && echo "- rust function json: $rust_function_json"
@@ -299,6 +419,8 @@ fi
   echo
   echo "status=$status"
   echo "kind=$kind"
+  echo "selection_score=${selection_score:-missing}"
+  echo "selection_reason=${selection_reason:-missing}"
   echo "source_function=${source_name:-unknown}"
   echo "source_location=${source_file:-unknown}:${source_start:-?}-${source_end:-?}"
   echo "rust_function=$rust_label"
@@ -321,6 +443,8 @@ fi
   echo '```'
   echo
   echo "## Evidence Files"
+  [[ -f "$missing_candidates_tsv" ]] && echo "- $missing_candidates_tsv"
+  [[ -f "$stub_candidates_tsv" ]] && echo "- $stub_candidates_tsv"
   [[ -f "$source_function_json" ]] && echo "- $source_function_json"
   [[ -f "$source_snippet" ]] && echo "- $source_snippet"
   [[ -f "$rust_function_json" ]] && echo "- $rust_function_json"
