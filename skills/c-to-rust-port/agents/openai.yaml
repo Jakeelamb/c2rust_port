@@ -1,0 +1,6 @@
+interface:
+  display_name: "C to Rust Port"
+  short_description: "Faithful C/C++ to Rust port workflow"
+  default_prompt: "Use $c-to-rust-port to plan and drive a source-backed C/C++ to Rust port."
+policy:
+  allow_implicit_invocation: true
